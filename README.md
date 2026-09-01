@@ -1,233 +1,116 @@
-# waterui-str
+# suiteki
 
-A memory-efficient, reference-counted string type optimized for both static and owned strings.
+[![crates.io](https://img.shields.io/crates/v/suiteki.svg)](https://crates.io/crates/suiteki)
+[![docs.rs](https://docs.rs/suiteki/badge.svg)](https://docs.rs/suiteki)
 
-## Overview
+A string type that borrows static strings and reference-counts owned ones.
 
-`waterui-str` provides `Str`, a hybrid string type that automatically chooses between static string references and reference-counted owned strings. This design eliminates unnecessary allocations for static strings while enabling efficient cloning for owned strings through reference counting.
+`Str` is two words wide — a pointer and a signed length — and stores one of two
+things. A `&'static str` is kept as-is: no allocation, and cloning is a pointer
+copy. An owned `String` is moved into a reference-counted box: one allocation,
+and cloning is a counter increment rather than a copy of the bytes. The sign of
+the length tells the two apart, so nothing is spent on a discriminant.
 
-The crate is designed for `no_std` environments (with `alloc`), making it suitable for embedded systems and WebAssembly targets. It integrates seamlessly with `WaterUI`'s reactive system through the `nami-core` integration.
+It derefs to `str`, so every `str` method is available, and it implements the
+usual traits (`Debug`, `Display`, `Hash`, `Ord`, `Borrow<str>`, `FromStr`,
+`FromIterator`, `Add`, `Extend`, `Index`) so it drops into existing code.
 
-Key features:
-- **Zero-cost static strings**: Static string literals stored as pointers without allocation
-- **Reference-counted owned strings**: Efficient cloning through internal reference counting
-- **Transparent API**: Derefs to `&str`, works with all standard string operations
-- **Reactive integration**: Compatible with `WaterUI`'s `nami` reactive primitives via `impl_constant!`
-- **Optional serde support**: Serialize and deserialize with the `serde` feature
-
-## Installation
-
-Add to your `Cargo.toml`:
-
-```toml
-[dependencies]
-waterui-str = "0.2"
-```
-
-With serde support:
-
-```toml
-[dependencies]
-waterui-str = { version = "0.2", features = ["serde"] }
-```
-
-## Quick Start
+The crate is `no_std` and needs only `alloc`.
 
 ```rust
-use waterui_str::Str;
+use suiteki::Str;
 
-// Static strings - no allocation
-let static_str = Str::from("hello");
+// A literal costs nothing to store and nothing to clone.
+let greeting = Str::from("hello");
+assert_eq!(greeting.len(), 5);
+assert!(greeting.starts_with("hel"));
 
-// Owned strings - reference counted
+// An owned string is refcounted, so this clone copies no bytes.
 let owned = Str::from(String::from("world"));
+let alias = owned.clone();
+assert_eq!(alias, "world");
 
-// Cheap cloning
-let clone = owned.clone(); // Just increments ref count
-
-// Transparent string operations
-assert_eq!(static_str.len(), 5);
-assert!(static_str.starts_with("hel"));
-
-// Concatenation
-let combined = static_str + " " + &owned;
+// It concatenates and compares like any other string type.
+let combined = greeting + " " + &owned;
 assert_eq!(combined, "hello world");
 ```
 
-## Core Concepts
-
-### Internal Representation
-
-`Str` uses a clever tagged pointer representation:
-
-- **Positive length**: Points to static string data (`&'static str`)
-- **Negative length**: Points to `Shared` (reference-counted `String`)
-
-This allows zero-overhead discrimination between static and owned strings at runtime.
-
-### Reference Counting
-
-Owned strings use internal reference counting via `Shared`:
-- Clone operations increment the reference count
-- Drop operations decrement the count and free memory when reaching zero
-- Reference counts are intentionally not exposed in the public API
-
-### Memory Optimization
-
-Empty strings always use a static empty string reference, regardless of how they're created:
+Empty strings always take the static representation, however they are built:
 
 ```rust
-use waterui_str::Str;
+use suiteki::Str;
 
-let empty1 = Str::new();
-let empty2 = Str::from("");
-let empty3 = Str::from(String::new());
-
-// All three use the same static "" reference
+assert!(Str::new().is_empty());
+assert!(Str::from("").is_empty());
+assert!(Str::from(String::new()).is_empty());
 ```
 
-## Examples
-
-### Creating Strings
+`into_string` takes the allocation back when this is the last reference, and
+copies only when it is not:
 
 ```rust
-use waterui_str::Str;
+use suiteki::Str;
 
-// From static string literal
-let s1 = Str::from("hello");
+let s = Str::from(String::from("owned"));
+let shared = s.clone();
 
-// From owned String
-let s2 = Str::from(String::from("hello"));
+let copied = s.into_string(); // `shared` is still alive, so this copies.
+assert_eq!(copied, "owned");
 
-// From UTF-8 bytes
-let bytes = vec![104, 101, 108, 108, 111]; // "hello"
-let s3 = Str::from_utf8(bytes).unwrap();
-
-// Empty string
-let s4 = Str::new();
+let moved = shared.into_string(); // Last reference: takes the `String`.
+assert_eq!(moved, "owned");
 ```
 
-### String Manipulation
+## Installation
 
-```rust
-use waterui_str::Str;
-
-let mut s = Str::from("hello");
-s.append(" world");
-assert_eq!(s, "hello world");
-
-// Concatenation with +
-let s1 = Str::from("foo");
-let s2 = s1 + "bar";
-assert_eq!(s2, "foobar");
-
-// AddAssign
-let mut s3 = Str::from("hello");
-s3 += " world";
-assert_eq!(s3, "hello world");
+```toml
+[dependencies]
+suiteki = "0.1"
 ```
 
-### Iteration and Collection
+## Features
 
-```rust
-use waterui_str::Str;
+| Feature | Default | Effect |
+| --- | --- | --- |
+| `std` | yes | `AsRef<OsStr>`, `AsRef<Path>`, `TryFrom<OsString>` and `ToSocketAddrs`. Turn it off for a `no_std` build. |
+| `serde` | no | `Serialize` and `Deserialize` for `Str`. |
+| `nami` | no | Registers `Str` as a constant signal for the [`nami`](https://crates.io/crates/nami) reactive framework. |
 
-// Collect from iterator
-let words = vec!["hello", " ", "world"];
-let s: Str = words.into_iter().collect();
-assert_eq!(s, "hello world");
+## Reference counting
 
-// Extend
-let mut s = Str::from("hello");
-s.extend(vec![" ", "world"]);
-assert_eq!(s, "hello world");
+The count is not part of the public API, and there is no way to read it. That
+keeps `Str` a value type: code cannot branch on how many aliases exist, and the
+representation stays free to change. The count is non-atomic, so `Str` is
+neither `Send` nor `Sync` — it is meant to be cheap on one thread, not shared
+across several.
+
+## Benchmarks
+
+```sh
+cargo bench --all-features
 ```
 
-### Conversion to String
+The suite covers construction from a `&'static str`, from a `String` and from a
+borrowed `&str`, plus clone, deref, equality, hashing and `to_string`, at byte
+lengths from 0 to 4096. `tests/allocations.rs` pins the allocation counts those
+paths are allowed to make.
 
-```rust
-use waterui_str::Str;
+## Miri
 
-let s1 = Str::from(String::from("owned"));
-let s2 = s1.clone();
+The type is built on raw pointers and a hand-written reference count, so the
+test suite doubles as a memory-safety suite:
 
-// Convert to String - takes ownership if ref count is 1
-let string1 = s1.into_string(); // Copies because s2 still exists
-assert_eq!(string1, "owned");
-
-// s2 is now the only reference
-let string2 = s2.into_string(); // No copy, takes ownership
-assert_eq!(string2, "owned");
+```sh
+./run_miri_tests.sh
 ```
 
-## API Overview
+## Origin
 
-### Construction
-- `Str::new()` - Create empty string
-- `Str::from_static(&'static str)` - Create from static string literal
-- `Str::from_utf8(Vec<u8>)` - Create from UTF-8 bytes with validation
-- `unsafe Str::from_utf8_unchecked(Vec<u8>)` - Create from UTF-8 bytes without validation
-
-### Inspection
-- `as_str(&self) -> &str` - Get string slice
-- `len(&self) -> usize` - Get byte length
-- `is_empty(&self) -> bool` - Check if empty
-
-### Modification
-- `append(&mut self, &str)` - Append string
-- `into_string(self) -> String` - Convert to owned String
-
-### Traits Implemented
-- `Deref<Target = str>` - Transparent access to string methods
-- `Clone` - Efficient reference-counted cloning
-- `Default` - Empty string
-- `Display`, `Debug` - Formatting
-- `Hash`, `Eq`, `Ord` - Collections and comparisons
-- `AsRef<str>`, `AsRef<[u8]>`, `Borrow<str>` - Conversions
-- `FromStr`, `FromIterator` - Parsing and collection
-- `Add`, `AddAssign` - Concatenation
-- `Extend` - Extension from iterators
-- `Index<I>` - Slice indexing
-
-### Standard Library Integration (when `std` is available)
-- `AsRef<OsStr>`, `AsRef<Path>` - Filesystem operations
-- `TryFrom<OsString>` - OS string conversion
-- `ToSocketAddrs` - Network address resolution
-
-## Design Rationale
-
-### Why Not `Cow<'static, str>`?
-
-While `Cow<'static, str>` provides similar functionality, `Str` offers:
-- **Better clone performance**: Reference counting vs. full string copy for `Cow::Owned`
-- **Smaller size**: Single pointer + length vs. discriminant + pointer + length
-- **Specialized API**: Methods like `append()` optimized for the use case
-
-### Why Hide Reference Counts?
-
-The internal reference count is deliberately not exposed in the public API. This:
-- Prevents code from relying on reference count values
-- Allows future optimization changes without breaking the API
-- Encourages treating `Str` as a simple value type
-
-### Memory Safety
-
-The crate includes extensive memory safety tests designed for Miri (Rust's undefined behavior detector), covering:
-- Clone/drop cycle patterns
-- Interleaved operations
-- Reference counting edge cases
-- Pointer stability guarantees
-- Large string handling
-- Concurrent-like access patterns (single-threaded stress tests)
-
-## Performance Characteristics
-
-- **Static strings**: Zero allocation, zero cost to clone
-- **Owned strings**: Single allocation, O(1) clone (ref count increment)
-- **Deref operations**: Zero cost - compiles to a pointer dereference
-- **`into_string()` with unique ownership**: Zero copy, takes ownership
-- **`into_string()` with shared ownership**: Single allocation and copy
+`suiteki` (水滴, "water droplet") was extracted from the
+[WaterUI](https://github.com/water-rs/waterui) framework, where it lived as
+`waterui-str`, and is maintained as a standalone library.
 
 ## License
 
-Licensed under the same terms as the `WaterUI` project.
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option.

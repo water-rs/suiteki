@@ -188,7 +188,7 @@ impl Str {
     /// # Examples
     ///
     /// ```
-    /// use waterui_str::Str;
+    /// use suiteki::Str;
     ///
     /// let s = Str::from_static("hello");
     /// assert_eq!(s, "hello");
@@ -247,7 +247,7 @@ impl Str {
     /// # Examples
     ///
     /// ```
-    /// use waterui_str::Str;
+    /// use suiteki::Str;
     ///
     /// let s1 = Str::from("hello");
     /// assert_eq!(s1.as_str(), "hello");
@@ -270,7 +270,7 @@ impl Str {
     /// # Examples
     ///
     /// ```
-    /// use waterui_str::Str;
+    /// use suiteki::Str;
     /// let s = Str::from("hello");
     /// assert_eq!(s.len(), 5);
     /// ```
@@ -284,7 +284,7 @@ impl Str {
     /// # Examples
     ///
     /// ```
-    /// use waterui_str::Str;
+    /// use suiteki::Str;
     /// let s = Str::new();
     /// assert!(s.is_empty());
     /// let s2 = Str::from("not empty");
@@ -306,7 +306,7 @@ impl Str {
     /// # Examples
     ///
     /// ```
-    /// use waterui_str::Str;
+    /// use suiteki::Str;
     ///
     /// let s1 = Str::from("static");
     /// let s1_string = s1.into_string();
@@ -346,7 +346,7 @@ impl Str {
     /// # Examples
     ///
     /// ```
-    /// use waterui_str::Str;
+    /// use suiteki::Str;
     ///
     /// let s = Str::new();
     /// assert_eq!(s, "");
@@ -370,7 +370,7 @@ impl Str {
     /// # Examples
     ///
     /// ```
-    /// use waterui_str::Str;
+    /// use suiteki::Str;
     ///
     /// let bytes = vec![104, 101, 108, 108, 111]; // "hello" in UTF-8
     /// let s = Str::from_utf8(bytes).unwrap();
@@ -394,7 +394,7 @@ impl Str {
     /// # Examples
     ///
     /// ```
-    /// use waterui_str::Str;
+    /// use suiteki::Str;
     ///
     /// // SAFETY: We know these bytes form valid UTF-8
     /// let bytes = vec![104, 101, 108, 108, 111]; // "hello" in UTF-8
@@ -424,7 +424,7 @@ impl Str {
     /// # Examples
     ///
     /// ```
-    /// use waterui_str::Str;
+    /// use suiteki::Str;
     ///
     /// let mut s = Str::from("hello");
     /// s.append(" world");
@@ -444,7 +444,7 @@ impl From<&'static str> for Str {
     /// # Examples
     ///
     /// ```
-    /// use waterui_str::Str;
+    /// use suiteki::Str;
     ///
     /// let s = Str::from("hello");
     /// assert_eq!(s, "hello");
@@ -463,7 +463,7 @@ impl From<String> for Str {
     /// # Examples
     ///
     /// ```
-    /// use waterui_str::Str;
+    /// use suiteki::Str;
     ///
     /// let s = Str::from(String::from("hello"));
     /// assert_eq!(s, "hello");
