@@ -16,7 +16,10 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
+  # `contents` for pushing the history to `gh-pages`; `pull-requests` for the
+  # alert comment on a pull request.
   contents: write
+  pull-requests: write
 
 env:
   CARGO_TERM_COLOR: always
