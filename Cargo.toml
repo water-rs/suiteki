@@ -23,7 +23,12 @@ serde = { version = "1.0", default-features = false, features = [
 nami-core = { version = "0.3.3", default-features = false, optional = true }
 
 [features]
-default = []
+# `std` only adds the impls that need the standard library's own types
+# (`OsStr`, `Path`, `ToSocketAddrs`). It is on by default because those impls
+# are part of the API every current consumer compiles against; turning it off
+# is what makes this a genuine `no_std + alloc` crate.
+default = ["std"]
+std = []
 serde = ["dep:serde"]
 nami = ["dep:nami-core"]
 

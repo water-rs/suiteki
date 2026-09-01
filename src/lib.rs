@@ -1,4 +1,5 @@
 #![doc = include_str!("../README.md")]
+#![no_std]
 extern crate alloc;
 
 mod impls;
@@ -129,7 +130,9 @@ impl From<Cow<'static, str>> for Str {
     }
 }
 
-/// Implementations available when the `std` library is available.
+/// Implementations of the traits whose types only exist in the standard
+/// library, behind the default-on `std` feature.
+#[cfg(feature = "std")]
 mod std_on {
     use alloc::{string::FromUtf8Error, vec::IntoIter};
 
