@@ -22,6 +22,9 @@ serde = { version = "1.0", default-features = false, features = [
 ], optional = true }
 nami-core = { version = "0.3.3", default-features = false, optional = true }
 
+[dev-dependencies]
+criterion = { version = "0.8", features = ["html_reports"] }
+
 [features]
 # `std` only adds the impls that need the standard library's own types
 # (`OsStr`, `Path`, `ToSocketAddrs`). It is on by default because those impls
@@ -31,6 +34,24 @@ default = ["std"]
 std = []
 serde = ["dep:serde"]
 nami = ["dep:nami-core"]
+
+# `cargo bench` hands its arguments to every target that has a bench harness.
+# Only the criterion target below understands them, so the default libtest
+# harness is turned off everywhere else.
+[lib]
+bench = false
+
+[[test]]
+name = "allocations"
+bench = false
+
+[[test]]
+name = "debug_representation"
+bench = false
+
+[[bench]]
+name = "str"
+harness = false
 
 [lints.rust]
 missing_docs = "warn"
