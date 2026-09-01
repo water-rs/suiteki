@@ -23,7 +23,7 @@ use suiteki::Str;
 // A literal costs nothing to store and nothing to clone.
 let greeting = Str::from("hello");
 assert_eq!(greeting.len(), 5);
-assert!(greeting.starts_with("hel"));
+assert!(greeting.starts_with("hello"));
 
 // An owned string is refcounted, so this clone copies no bytes.
 let owned = Str::from(String::from("world"));
