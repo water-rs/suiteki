@@ -1,0 +1,46 @@
+name: Bench
+
+# Wall-clock numbers on a shared runner are noisy, so this is a trend series
+# rather than a merge gate: pull requests run the benchmarks and get a comment
+# when a measurement crosses the alert threshold, and only pushes to `main`
+# extend the stored history on `gh-pages`. The hard, deterministic gate on how
+# many allocations each path makes lives in `tests/allocations.rs`, which the
+# ordinary test job already runs.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bench:
+    name: Bench
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: bench-ubuntu
+      - run: cargo bench --all-features -- --output-format bencher | tee bench.txt
+      - uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: suiteki
+          tool: cargo
+          output-file-path: bench.txt
+          benchmark-data-dir-path: dev/bench
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: ${{ github.event_name == 'push' }}
+          comment-on-alert: true
+          alert-threshold: "150%"
+          fail-on-alert: false
