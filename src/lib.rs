@@ -19,6 +19,7 @@ use core::{
     slice,
 };
 
+#[cfg(feature = "nami")]
 nami_core::impl_constant!(Str);
 
 /// A string type that can be either a static reference or a ref-counted owned string.

@@ -20,11 +20,12 @@ maintenance = { status = "actively-developed" }
 serde = { version = "1.0", default-features = false, features = [
   "alloc",
 ], optional = true }
-nami-core = { version = "0.3.3", default-features = false }
+nami-core = { version = "0.3.3", default-features = false, optional = true }
 
 [features]
 default = []
 serde = ["dep:serde"]
+nami = ["dep:nami-core"]
 
 [lints.rust]
 missing_docs = "warn"
