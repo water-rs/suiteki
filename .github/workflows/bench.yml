@@ -16,7 +16,10 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
+  # `contents` for pushing the history to `gh-pages`; `pull-requests` for the
+  # alert comment on a pull request.
   contents: write
+  pull-requests: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -32,7 +35,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: bench-ubuntu
+      # Criterion keeps its baselines under `target/criterion` by default, which
+      # rust-cache then carries between runs: a cancelled run leaves a
+      # half-written baseline behind and the next run fails reading it. Keep the
+      # baselines out of the cached tree; the trend series lives on `gh-pages`.
       - run: cargo bench --all-features -- --output-format bencher | tee bench.txt
+        env:
+          CRITERION_HOME: ${{ runner.temp }}/criterion
       - uses: benchmark-action/github-action-benchmark@v1
         with:
           name: suiteki
