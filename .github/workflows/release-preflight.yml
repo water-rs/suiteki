@@ -1,0 +1,29 @@
+name: Release preflight
+
+# Guards the one failure a crates.io publish cannot undo: shipping a version
+# number that already exists with different contents. crates.io versions are
+# immutable, so a missed bump ships a crate that no longer matches what
+# consumers compile against.
+#
+# release-plz runs this check itself when it prepares a release PR. Running it
+# on every pull request into `main` means a breaking change is caught while it
+# is still reviewable, rather than at publish time.
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  semver:
+    name: Local API vs published baseline
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: obi1kenobi/cargo-semver-checks-action@v2
