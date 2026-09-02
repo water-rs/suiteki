@@ -119,8 +119,11 @@ impl Drop for Str {
             // SAFETY: as above; the box was leaked by `from_string`.
             drop(unsafe { Box::from_raw(ptr) });
         } else {
-            // SAFETY: there is a live `Shared` here, and this `Str` holds one of
-            // its counts; dropping releases exactly that one.
+            // SAFETY: `Shared::decrement_count` asks for an unreleased count on
+            // a live `Shared` that is not the last one. `as_shared` returning
+            // `Some` proves the allocation is live and that this `Str` owns a
+            // count on it, `is_unique` answering `false` proves the count is not
+            // the last, and `Drop` runs once, so it is released once.
             unsafe {
                 shared.decrement_count();
             }
@@ -135,9 +138,11 @@ impl Clone for Str {
     /// For owned strings, this increments the reference count.
     fn clone(&self) -> Self {
         if let Some(shared) = self.as_shared() {
-            // SAFETY: `as_shared` returning `Some` proves this is a shared string,
-            // so there is a live `Shared` to count; the clone below takes that new
-            // count.
+            // SAFETY: `Shared::increment_count` asks for an unreleased count on
+            // a live `Shared`, and that the count it creates go to exactly one
+            // new `Str`. `as_shared` returning `Some` proves this `Str` owns
+            // such a count, and the `Str` returned below is the sole taker of
+            // the new one.
             unsafe {
                 shared.increment_count();
             }
@@ -428,8 +433,11 @@ impl Str {
                 self.tag_word() & LEN_MASK,
             ),
             Repr::Shared => {
-                // SAFETY: the `Shared` outlives this borrow because `self` holds
-                // a count on it.
+                // SAFETY: `as_shared_unchecked` asks for the shared
+                // representation, which the match arm establishes, and
+                // `Shared::as_str` asks for a count that outlives the returned
+                // `&str`. This `Str` owns such a count and `&self` outlives the
+                // borrow, so the allocation cannot be reclaimed while it lives.
                 return unsafe { self.as_shared_unchecked().as_str() };
             }
         };
@@ -506,9 +514,17 @@ impl Str {
     pub fn into_string(self) -> String {
         let this = ManuallyDrop::new(self);
         match this.repr() {
-            // SAFETY: `self` is wrapped in `ManuallyDrop`, so its count is not
-            // released twice. When unique, this is the last owner and may reclaim
-            // the box; otherwise it drops its own count and copies the contents.
+            // SAFETY: `self` is wrapped in `ManuallyDrop`, so the count it owns
+            // is released exactly once, here, and `as_shared_unchecked` is
+            // reached under `Repr::Shared`, which is what it asks for. In the
+            // unique branch, `Shared::take` asks for the last count and for the
+            // leaked box to have been reclaimed: `is_unique` answered `true` and
+            // `Box::from_raw` takes back what `from_string` leaked. In the other
+            // branch, `Shared::decrement_count` asks for an unreleased count
+            // that is not the last, which `is_unique` answering `false` proves,
+            // and `Shared::as_str` asks for a count that outlives the borrow,
+            // which the owner that same answer proves still exists holds for as
+            // long as the bytes are copied out.
             Repr::Shared => unsafe {
                 let shared = this.as_shared_unchecked();
                 if shared.is_unique() {
