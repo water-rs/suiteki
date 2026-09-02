@@ -1,14 +1,20 @@
 //! Pins how many allocations each construction path is allowed to make.
 //!
-//! The whole point of `Str` is which of these numbers are zero: a static string
-//! never reaches the allocator, and an owned one reaches it exactly once, for
-//! the reference-counted box. Clones never allocate at all. Those are claims
-//! about behaviour, not about wall-clock time, so they belong in a test rather
-//! than in the benchmarks — and they are the baseline any future small-string
-//! optimization has to move deliberately rather than by accident.
+//! The whole point of `Str` is which of these numbers are zero: a string that
+//! fits inline never reaches the allocator at all, a static string never
+//! reaches it either, and a longer owned one reaches it exactly once, for the
+//! reference-counted box. Clones, comparisons, hashes and derefs never allocate
+//! whatever the representation. Those are claims about behaviour, not about
+//! wall-clock time, so they belong in a test rather than in the benchmarks —
+//! and they are what keeps the small-string optimization from being undone by
+//! accident.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::hint::black_box;
+use std::ops::Deref;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use suiteki::Str;
@@ -71,7 +77,7 @@ fn construction_allocates_only_where_it_has_to() {
     let (from_static, kept) = allocations_during(|| Str::from(black_box("a static string")));
     drop(kept);
 
-    let owned = String::from("an owned string");
+    let owned = String::from("an owned string, too long to fit inline");
     let (from_string, kept) = allocations_during(|| Str::from(black_box(owned)));
 
     let (clone_owned, clones) = allocations_during(|| (kept.clone(), kept.clone()));
@@ -102,4 +108,104 @@ fn construction_allocates_only_where_it_has_to() {
         into_string_unique, 0,
         "the last reference hands its `String` back without copying"
     );
+
+    // Not a `#[test]` of its own: the counter is process-global and the harness
+    // would run two tests on two threads at once.
+    #[cfg(target_pointer_width = "64")]
+    short_strings_never_reach_the_allocator();
+}
+
+/// What one string cost, on every path that has an opinion about allocation.
+#[derive(Debug)]
+struct Counts {
+    from_string: usize,
+    from_borrowed: usize,
+    clone: usize,
+    compare: usize,
+    hash: usize,
+    deref: usize,
+}
+
+/// Measures every one of those paths for `text`.
+///
+/// The `String` and the `&str` the constructors are handed are built outside
+/// the measured region, so what is counted is what `Str` itself does.
+fn counts_for(text: &str) -> Counts {
+    let source = String::from(text);
+
+    let (from_string, value) = allocations_during(|| Str::from(black_box(source)));
+    let (from_borrowed, parsed) = allocations_during(|| Str::from_str(black_box(text)).unwrap());
+    let (clone, cloned) = allocations_during(|| black_box(&value).clone());
+    let (compare, equal) = allocations_during(|| black_box(&value) == black_box(&parsed));
+    let (hash, _) = allocations_during(|| {
+        let mut hasher = DefaultHasher::new();
+        black_box(&value).hash(&mut hasher);
+        hasher.finish()
+    });
+    let (deref, length) = allocations_during(|| black_box(&value).deref().len());
+
+    assert!(equal, "the two constructions disagree about {text:?}");
+    assert_eq!(
+        length,
+        text.len(),
+        "the deref of {text:?} is the wrong length"
+    );
+    drop((value, parsed, cloned));
+
+    Counts {
+        from_string,
+        from_borrowed,
+        clone,
+        compare,
+        hash,
+        deref,
+    }
+}
+
+/// The small-string optimization, as a claim about the allocator.
+///
+/// Fifteen bytes is the inline capacity of a two-word `Str` on a 64-bit target;
+/// on a 32-bit one the same reasoning holds at seven, so the exact numbers are
+/// only asserted where they are the right ones.
+#[cfg(target_pointer_width = "64")]
+fn short_strings_never_reach_the_allocator() {
+    for text in ["", "x", "fifteen bytes!!"] {
+        assert!(text.len() <= 15, "{text:?} is not a short string");
+        let counts = counts_for(text);
+        assert_eq!(
+            counts.from_string,
+            0,
+            "a {}-byte string fits inline: {counts:?}",
+            text.len()
+        );
+        assert_eq!(
+            counts.from_borrowed, 0,
+            "and so does a copy of one: {counts:?}"
+        );
+        assert_eq!(
+            counts.clone, 0,
+            "cloning inline bytes copies them: {counts:?}"
+        );
+        assert_eq!(counts.compare, 0, "comparing reads bytes: {counts:?}");
+        assert_eq!(counts.hash, 0, "hashing reads bytes: {counts:?}");
+        assert_eq!(counts.deref, 0, "and so does a deref: {counts:?}");
+    }
+
+    // One byte past the inline capacity, the shared box appears — once.
+    let counts = counts_for("sixteen bytes!!!");
+    assert_eq!(
+        counts.from_string, 1,
+        "sixteen bytes allocate the shared box: {counts:?}"
+    );
+    assert_eq!(
+        counts.from_borrowed, 2,
+        "from a borrowed `&str`, the `String` it is copied into as well: {counts:?}"
+    );
+    assert_eq!(
+        counts.clone, 0,
+        "cloning a shared string bumps a counter: {counts:?}"
+    );
+    assert_eq!(counts.compare, 0, "comparing reads bytes: {counts:?}");
+    assert_eq!(counts.hash, 0, "hashing reads bytes: {counts:?}");
+    assert_eq!(counts.deref, 0, "and so does a deref: {counts:?}");
 }
