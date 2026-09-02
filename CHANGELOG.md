@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1](https://github.com/water-rs/suiteki/compare/v0.1.0...v0.1.1) - 2026-09-02
+
+### Other
+
+- *(changelog)* curate the first standalone entry
+- release v0.1.0
+
 ## [0.1.0](https://github.com/water-rs/suiteki/releases/tag/v0.1.0) - 2026-09-01
 
 First standalone release. `suiteki` is the string type formerly published as
