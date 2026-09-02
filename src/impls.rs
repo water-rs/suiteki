@@ -10,7 +10,7 @@ use core::{
     str::FromStr,
 };
 
-use alloc::string::{String, ToString};
+use alloc::string::String;
 
 use crate::Str;
 
@@ -71,8 +71,10 @@ impl<I: SliceIndex<str>> Index<I> for Str {
 
 impl FromStr for Str {
     type Err = Infallible;
+
+    /// Copies the string, inline when it fits.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self::from(s.to_string()))
+        Ok(Self::from_borrowed(s))
     }
 }
 
@@ -181,7 +183,7 @@ mod serde {
     use core::ops::Deref;
 
     use super::Str;
-    use alloc::string::{String, ToString};
+    use alloc::string::String;
     use serde::{Deserialize, Deserializer, Serialize, de::Visitor};
     struct StrVisitor;
 
@@ -202,7 +204,7 @@ mod serde {
         }
 
         fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
-            Ok(v.to_string().into())
+            Ok(Str::from_borrowed(v))
         }
 
         fn visit_string<E>(self, v: String) -> Result<Self::Value, E> {

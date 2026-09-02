@@ -1,10 +1,10 @@
 //! Benchmarks for every operation whose cost depends on how a `Str` is stored.
 //!
-//! The byte lengths bracket the 15-byte boundary a small-string optimization
-//! would introduce: 0, 7 and 15 bytes fit inline in a two-word `Str`, 16 does
-//! not, and the rest establish how each path scales once the string is clearly
-//! heap-sized. Keeping all eight lengths in the trend series is what makes a
-//! future SSO visible as a step at 15/16 rather than a uniform shift.
+//! The byte lengths bracket the 15-byte inline boundary: 0, 7 and 15 bytes fit
+//! inline in a two-word `Str`, 16 and 17 do not, and the rest establish how
+//! each path scales once the string is clearly heap-sized. Keeping all nine
+//! lengths in the trend series is what makes the small-string optimization
+//! visible as a step at 15/16 rather than a uniform shift.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -19,7 +19,7 @@ use criterion::{
 use suiteki::Str;
 
 /// Byte lengths every group is measured at.
-const LENGTHS: [usize; 8] = [0, 7, 15, 16, 31, 64, 256, 4096];
+const LENGTHS: [usize; 9] = [0, 7, 15, 16, 17, 31, 64, 256, 4096];
 
 /// The bytes the pool cycles through.
 const ALPHABET: &[u8; 26] = b"abcdefghijklmnopqrstuvwxyz";
