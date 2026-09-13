@@ -282,6 +282,7 @@ impl Str {
     /// // Reference count is intentionally not exposed
     /// ```
     #[must_use]
+    #[inline]
     pub const fn from_static(s: &'static str) -> Self {
         let len = s.len();
         assert!(len <= MAX_LEN, "a `Str` cannot describe a string this long");
@@ -356,6 +357,7 @@ impl Str {
     }
 
     /// Creates a `Str` holding a copy of `s`, inline when it fits.
+    #[inline]
     pub(crate) fn from_borrowed(s: &str) -> Self {
         if s.len() <= INLINE_CAPACITY {
             Self::from_inline(s, "")
@@ -367,7 +369,11 @@ impl Str {
     /// # Panics
     ///
     /// Panics if the string is longer than a quarter of the address space.
-    #[inline]
+    #[expect(
+        clippy::inline_always,
+        reason = "x86-64 cross-crate codegen otherwise outlines the empty owned-string fast path"
+    )]
+    #[inline(always)]
     fn from_string(string: String) -> Self {
         let len = string.len();
         if len == 0 {
@@ -584,6 +590,7 @@ impl Str {
     /// // Reference count is intentionally not exposed
     /// ```
     #[must_use]
+    #[inline]
     pub const fn new() -> Self {
         Self::from_static("")
     }
