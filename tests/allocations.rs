@@ -10,39 +10,45 @@
 //! being undone by accident.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::hint::black_box;
 use std::ops::Deref;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use suiteki::Str;
 
-static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+// Thread-local, not process-global: the test harness runs code on other
+// threads, and a shared counter would count their allocations too. The `const`
+// initializer keeps the cell in the thread's static TLS block, so reading and
+// writing it inside the allocator never allocates or registers a destructor.
+thread_local! {
+    static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+}
 
 /// `System`, plus a counter on the allocating half of the interface.
 struct Counting;
 
 // SAFETY: every method forwards to `System` with the arguments it was given and
 // returns exactly what `System` returned, so the allocator contract is upheld by
-// `System` itself. The counter is a relaxed atomic add with no bearing on it.
+// `System` itself. The counter is a thread-local cell bump with no bearing on it.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        ALLOCATIONS.with(|count| count.set(count.get() + 1));
         // SAFETY: `layout` is forwarded unchanged from our own caller, which is
         // bound by the same contract.
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        ALLOCATIONS.with(|count| count.set(count.get() + 1));
         // SAFETY: as above.
         unsafe { System.alloc_zeroed(layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        ALLOCATIONS.with(|count| count.set(count.get() + 1));
         // SAFETY: `ptr` and `layout` describe a block this allocator handed out
         // through `System`, forwarded unchanged.
         unsafe { System.realloc(ptr, layout, new_size) }
@@ -57,15 +63,11 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOCATOR: Counting = Counting;
 
-/// Counts the allocations `f` makes.
-///
-/// The counter is process-global, so everything measured here lives in one test
-/// function: two of these running on different threads would count each other's
-/// allocations.
+/// Counts the allocations `f` makes on this thread.
 fn allocations_during<T>(f: impl FnOnce() -> T) -> (usize, T) {
-    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    let before = ALLOCATIONS.with(Cell::get);
     let value = f();
-    let after = ALLOCATIONS.load(Ordering::Relaxed);
+    let after = ALLOCATIONS.with(Cell::get);
     (after - before, value)
 }
 
@@ -163,8 +165,6 @@ fn construction_allocates_only_where_it_has_to() {
         assert_eq!(string.capacity(), size);
     }
 
-    // Not a `#[test]` of its own: the counter is process-global and the harness
-    // would run two tests on two threads at once.
     #[cfg(target_pointer_width = "64")]
     short_borrowed_strings_never_reach_the_allocator();
 }
