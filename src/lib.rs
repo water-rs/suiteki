@@ -162,6 +162,7 @@ impl Deref for Str {
     type Target = str;
 
     /// Provides access to the underlying string slice.
+    #[inline]
     fn deref(&self) -> &Self::Target {
         self.as_str()
     }
@@ -461,6 +462,7 @@ impl Str {
     /// assert_eq!(s2.as_str(), "world");
     /// ```
     #[must_use]
+    #[inline]
     pub const fn as_str(&self) -> &str {
         let (ptr, len) = match self.repr() {
             // The inline bytes start at the first byte of the `Str` and run up

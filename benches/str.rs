@@ -391,6 +391,31 @@ fn constructor_pairs(c: &mut Criterion) {
     group.finish();
 }
 
+fn format_pairs(c: &mut Criterion) {
+    let mut group = c.benchmark_group("format_pair");
+    for len in [15, 256, 4096] {
+        let current = Str::from(String::from(static_str(len)));
+        let pointer = current.as_str().as_ptr();
+        group.bench_function(BenchmarkId::new("current_display", len), |b| {
+            b.iter(|| black_box(&current).to_string());
+        });
+        group.bench_function(BenchmarkId::new("current_direct_copy", len), |b| {
+            b.iter(|| black_box(current.as_str()).to_owned());
+        });
+        let buffer = current.into_string();
+        assert_eq!(buffer.as_ptr(), pointer);
+        let baseline = suiteki_baseline::Str::from(buffer);
+        assert_eq!(baseline.as_str().as_ptr(), pointer);
+        group.bench_function(BenchmarkId::new("baseline_display", len), |b| {
+            b.iter(|| black_box(&baseline).to_string());
+        });
+        group.bench_function(BenchmarkId::new("baseline_direct_copy", len), |b| {
+            b.iter(|| black_box(baseline.as_str()).to_owned());
+        });
+    }
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     // Every measurement here is a handful of nanoseconds, so criterion's
@@ -400,6 +425,6 @@ criterion_group! {
     config = Criterion::default()
         .warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(2));
-    targets = construction, clone, access, ownership, representations, shared_ownership, comparisons, text_inputs, constructor_pairs
+    targets = construction, clone, access, ownership, representations, shared_ownership, comparisons, text_inputs, constructor_pairs, format_pairs
 }
 criterion_main!(benches);

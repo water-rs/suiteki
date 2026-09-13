@@ -106,7 +106,12 @@ impl Ord for Str {
 impl Display for Str {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.deref().fmt(f)
+        let text = self.as_str();
+        if f.width().is_none() && f.precision().is_none() {
+            f.write_str(text)
+        } else {
+            f.pad(text)
+        }
     }
 }
 
