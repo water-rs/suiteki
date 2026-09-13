@@ -4,7 +4,6 @@ use core::{
     convert::Infallible,
     fmt::Display,
     hash::{Hash, Hasher},
-    mem::take,
     ops::{Add, AddAssign, Deref, Index},
     slice::SliceIndex,
     str::FromStr,
@@ -21,8 +20,11 @@ impl Hash for Str {
 }
 
 impl PartialEq for Str {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
-        self.deref().eq(&**other)
+        let left = self.as_str();
+        let right = other.as_str();
+        left.len() == right.len() && (core::ptr::eq(left.as_ptr(), right.as_ptr()) || left == right)
     }
 }
 
@@ -73,6 +75,7 @@ impl FromStr for Str {
     type Err = Infallible;
 
     /// Copies the string, inline when it fits.
+    #[inline]
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(Self::from_borrowed(s))
     }
@@ -80,8 +83,9 @@ impl FromStr for Str {
 
 impl<S: AsRef<str>> FromIterator<S> for Str {
     fn from_iter<T: IntoIterator<Item = S>>(iter: T) -> Self {
-        iter.into_iter()
-            .fold(Self::new(), |state, s| state + s.as_ref())
+        let mut value = Self::new();
+        value.extend_parts(iter);
+        value
     }
 }
 
@@ -100,6 +104,7 @@ impl Ord for Str {
 }
 
 impl Display for Str {
+    #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.deref().fmt(f)
     }
@@ -120,27 +125,19 @@ impl fmt::Debug for Str {
 
 impl<'a> Extend<&'a str> for Str {
     fn extend<T: IntoIterator<Item = &'a str>>(&mut self, iter: T) {
-        self.handle(move |string| {
-            string.extend(iter);
-        });
+        self.extend_parts(iter);
     }
 }
 
 impl Extend<String> for Str {
     fn extend<T: IntoIterator<Item = String>>(&mut self, iter: T) {
-        self.handle(move |string| {
-            string.extend(iter);
-        });
+        self.extend_parts(iter);
     }
 }
 
 impl Extend<Self> for Str {
     fn extend<T: IntoIterator<Item = Self>>(&mut self, iter: T) {
-        self.handle(move |string| {
-            for s in iter {
-                string.push_str(&s);
-            }
-        });
+        self.extend_parts(iter);
     }
 }
 
@@ -159,9 +156,9 @@ where
     T: AsRef<str>,
 {
     type Output = Self;
-    fn add(self, rhs: T) -> Self::Output {
-        let rhs = rhs.as_ref();
-        (self.into_string() + rhs).into()
+    fn add(mut self, rhs: T) -> Self::Output {
+        self.append(rhs);
+        self
     }
 }
 
@@ -170,10 +167,7 @@ where
     T: AsRef<str>,
 {
     fn add_assign(&mut self, rhs: T) {
-        let rhs = rhs.as_ref();
-
-        let string = take(self).into_string();
-        *self = (string + rhs).into();
+        self.append(rhs);
     }
 }
 
