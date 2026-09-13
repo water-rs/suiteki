@@ -359,11 +359,18 @@ impl Str {
     /// Creates a `Str` holding a copy of `s`, inline when it fits.
     #[inline]
     pub(crate) fn from_borrowed(s: &str) -> Self {
-        if s.len() <= INLINE_CAPACITY {
+        if s.is_empty() {
+            Self::new()
+        } else if s.len() <= INLINE_CAPACITY {
             Self::from_inline(s, "")
         } else {
             Self::from_string(s.to_string())
         }
+    }
+
+    #[inline(never)]
+    fn allocate_owned(string: String) -> NonNull<()> {
+        NonNull::from(Box::leak(Box::new(Shared::new(string)))).cast::<()>()
     }
 
     /// # Panics
@@ -384,7 +391,7 @@ impl Str {
 
         Self {
             payload: Payload {
-                ptr: NonNull::from(Box::leak(Box::new(Shared::new(string)))).cast::<()>(),
+                ptr: Self::allocate_owned(string),
             },
             // SAFETY: a shared string is nonempty, so `len` is not zero, and
             // `to_le` keeps it that way.
@@ -839,12 +846,31 @@ mod tests {
     }
 
     #[test]
-    fn borrowed_strings_up_to_the_capacity_are_stored_inline() {
+    fn empty_construction_uses_static_storage() {
+        for value in [
+            Str::new(),
+            Str::from_borrowed(""),
+            Str::from(String::new()),
+            Str::from(String::with_capacity(64)),
+            Str::from_utf8(Vec::with_capacity(64)).unwrap(),
+        ] {
+            assert!(matches!(value.repr(), Repr::Static));
+            assert!(value.is_empty());
+            assert_eq!(value.as_str(), "");
+        }
+    }
+
+    #[test]
+    fn borrowed_strings_use_static_empty_or_inline_storage() {
         for len in 0..=INLINE_CAPACITY {
             let text: String = "abcdefghijklmno".chars().take(len).collect();
             let inline = Str::from_borrowed(&text);
 
-            assert!(matches!(inline.repr(), Repr::Inline), "{len} bytes");
+            if len == 0 {
+                assert!(matches!(inline.repr(), Repr::Static));
+            } else {
+                assert!(matches!(inline.repr(), Repr::Inline), "{len} bytes");
+            }
             assert_eq!(inline.as_str(), text, "{len} bytes");
             assert_eq!(inline.len(), len, "{len} bytes");
             assert_eq!(inline.is_empty(), len == 0, "{len} bytes");
