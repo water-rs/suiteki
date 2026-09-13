@@ -7,7 +7,9 @@
 # Install Miri first: rustup +nightly component add miri
 set -euo pipefail
 
-export MIRIFLAGS="-Zmiri-check-number-validity -Zmiri-symbolic-alignment-check -Zmiri-disable-isolation"
+# Number validity is checked unconditionally now; `-Zmiri-check-number-validity`
+# was removed, and passing it makes Miri refuse to start at all.
+export MIRIFLAGS="-Zmiri-symbolic-alignment-check -Zmiri-disable-isolation"
 export RUST_BACKTRACE=1
 
 cargo +nightly miri test --all-features

@@ -1,42 +1,54 @@
 //! Pins how many allocations each construction path is allowed to make.
 //!
-//! The whole point of `Str` is which of these numbers are zero: a static string
-//! never reaches the allocator, and an owned one reaches it exactly once, for
-//! the reference-counted box. Clones never allocate at all. Those are claims
-//! about behaviour, not about wall-clock time, so they belong in a test rather
-//! than in the benchmarks — and they are the baseline any future small-string
-//! optimization has to move deliberately rather than by accident.
+//! The whole point of `Str` is which of these numbers are zero: a borrowed
+//! copy that fits inline never reaches the allocator at all, a static string
+//! never reaches it either, and any nonempty owned one reaches it exactly once,
+//! for the reference-counted box. Clones, comparisons, hashes and derefs never
+//! allocate whatever the representation. Those are claims about behaviour, not
+//! about wall-clock time, so they belong in a test rather than in the
+//! benchmarks — and they are what keeps the small-string optimization from
+//! being undone by accident.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::hint::black_box;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::ops::Deref;
+use std::str::FromStr;
 
 use suiteki::Str;
 
-static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+// Thread-local, not process-global: the test harness runs code on other
+// threads, and a shared counter would count their allocations too. The `const`
+// initializer keeps the cell in the thread's static TLS block, so reading and
+// writing it inside the allocator never allocates or registers a destructor.
+thread_local! {
+    static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+}
 
 /// `System`, plus a counter on the allocating half of the interface.
 struct Counting;
 
 // SAFETY: every method forwards to `System` with the arguments it was given and
 // returns exactly what `System` returned, so the allocator contract is upheld by
-// `System` itself. The counter is a relaxed atomic add with no bearing on it.
+// `System` itself. The counter is a thread-local cell bump with no bearing on it.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        ALLOCATIONS.with(|count| count.set(count.get() + 1));
         // SAFETY: `layout` is forwarded unchanged from our own caller, which is
         // bound by the same contract.
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        ALLOCATIONS.with(|count| count.set(count.get() + 1));
         // SAFETY: as above.
         unsafe { System.alloc_zeroed(layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        ALLOCATIONS.with(|count| count.set(count.get() + 1));
         // SAFETY: `ptr` and `layout` describe a block this allocator handed out
         // through `System`, forwarded unchanged.
         unsafe { System.realloc(ptr, layout, new_size) }
@@ -51,15 +63,11 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOCATOR: Counting = Counting;
 
-/// Counts the allocations `f` makes.
-///
-/// The counter is process-global, so everything measured here lives in one test
-/// function: two of these running on different threads would count each other's
-/// allocations.
+/// Counts the allocations `f` makes on this thread.
 fn allocations_during<T>(f: impl FnOnce() -> T) -> (usize, T) {
-    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    let before = ALLOCATIONS.with(Cell::get);
     let value = f();
-    let after = ALLOCATIONS.load(Ordering::Relaxed);
+    let after = ALLOCATIONS.with(Cell::get);
     (after - before, value)
 }
 
@@ -71,7 +79,7 @@ fn construction_allocates_only_where_it_has_to() {
     let (from_static, kept) = allocations_during(|| Str::from(black_box("a static string")));
     drop(kept);
 
-    let owned = String::from("an owned string");
+    let owned = String::from("an owned string, too long to fit inline");
     let (from_string, kept) = allocations_during(|| Str::from(black_box(owned)));
 
     let (clone_owned, clones) = allocations_during(|| (kept.clone(), kept.clone()));
@@ -102,4 +110,155 @@ fn construction_allocates_only_where_it_has_to() {
         into_string_unique, 0,
         "the last reference hands its `String` back without copying"
     );
+
+    let capacity = 2 * size_of::<usize>() - 1;
+    for len in 0..=capacity {
+        let text = "x".repeat(len);
+        let (count, value) = allocations_during(|| Str::from_str(black_box(&text)).unwrap());
+        assert_eq!(count, 0);
+        assert_eq!(value.as_str(), text);
+        let mut value = value;
+        let suffix = "y".repeat(capacity - len);
+        let (count, ()) = allocations_during(|| value.append(black_box(&suffix)));
+        assert_eq!(count, 0);
+        assert_eq!(value.as_str(), text + &suffix);
+    }
+    let pieces = vec!["x"; capacity];
+    let (count, collected) =
+        allocations_during(|| black_box(&pieces).iter().copied().collect::<Str>());
+    assert_eq!(count, 0);
+    assert_eq!(collected.as_str(), "x".repeat(capacity));
+    let mut extended = Str::new();
+    let (count, ()) = allocations_during(|| extended.extend(black_box(&pieces).iter().copied()));
+    assert_eq!(count, 0);
+    assert_eq!(extended, collected);
+    let pieces = vec!["x"; capacity + 1];
+    let (count, collected) =
+        allocations_during(|| black_box(&pieces).iter().copied().collect::<Str>());
+    assert_eq!(count, 2);
+    assert_eq!(collected.as_str(), "x".repeat(capacity + 1));
+    for mut value in [
+        Str::from_static("static"),
+        Str::from(String::from("a heap string longer than the inline limit")),
+    ] {
+        let alias = value.clone();
+        let pointer = value.as_str().as_ptr();
+        let (count, ()) = allocations_during(|| value.append(black_box("")));
+        assert_eq!(count, 0);
+        assert_eq!(value.as_str().as_ptr(), pointer);
+        assert_eq!(value, alias);
+    }
+    for len in 1..=capacity {
+        let mut source = String::with_capacity(capacity * 4);
+        source.push_str(&"x".repeat(len));
+        let pointer = source.as_ptr();
+        let size = source.capacity();
+        let (count, value) = allocations_during(|| Str::from(black_box(source)));
+        assert_eq!(count, 1);
+        assert_eq!(value.as_str().as_ptr(), pointer);
+        let (count, alias) = allocations_during(|| value.clone());
+        assert_eq!(count, 0);
+        drop(alias);
+        let (count, string) = allocations_during(|| value.into_string());
+        assert_eq!(count, 0);
+        assert_eq!(string.as_ptr(), pointer);
+        assert_eq!(string.capacity(), size);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    short_borrowed_strings_never_reach_the_allocator();
+}
+
+/// What one string cost, on every path that has an opinion about allocation.
+#[derive(Debug)]
+struct Counts {
+    from_string: usize,
+    from_borrowed: usize,
+    clone: usize,
+    compare: usize,
+    hash: usize,
+    deref: usize,
+}
+
+/// Measures every one of those paths for `text`.
+///
+/// The `String` and the `&str` the constructors are handed are built outside
+/// the measured region, so what is counted is what `Str` itself does.
+fn counts_for(text: &str) -> Counts {
+    let source = String::from(text);
+
+    let (from_string, value) = allocations_during(|| Str::from(black_box(source)));
+    let (from_borrowed, parsed) = allocations_during(|| Str::from_str(black_box(text)).unwrap());
+    let (clone, cloned) = allocations_during(|| black_box(&value).clone());
+    let (compare, equal) = allocations_during(|| black_box(&value) == black_box(&parsed));
+    let (hash, _) = allocations_during(|| {
+        let mut hasher = DefaultHasher::new();
+        black_box(&value).hash(&mut hasher);
+        hasher.finish()
+    });
+    let (deref, length) = allocations_during(|| black_box(&value).deref().len());
+
+    assert!(equal, "the two constructions disagree about {text:?}");
+    assert_eq!(
+        length,
+        text.len(),
+        "the deref of {text:?} is the wrong length"
+    );
+    drop((value, parsed, cloned));
+
+    Counts {
+        from_string,
+        from_borrowed,
+        clone,
+        compare,
+        hash,
+        deref,
+    }
+}
+
+/// The small-string optimization, as a claim about the allocator.
+///
+/// Fifteen bytes is the inline capacity of a two-word `Str` on a 64-bit target;
+/// on a 32-bit one the same reasoning holds at seven, so the exact numbers are
+/// only asserted where they are the right ones.
+#[cfg(target_pointer_width = "64")]
+fn short_borrowed_strings_never_reach_the_allocator() {
+    for text in ["", "x", "fifteen bytes!!"] {
+        assert!(text.len() <= 15, "{text:?} is not a short string");
+        let counts = counts_for(text);
+        assert_eq!(
+            counts.from_string,
+            usize::from(!text.is_empty()),
+            "a nonempty owned string keeps its buffer in one shared box: {counts:?}"
+        );
+        assert_eq!(
+            counts.from_borrowed, 0,
+            "and so does a copy of one: {counts:?}"
+        );
+        assert_eq!(
+            counts.clone, 0,
+            "a clone bumps the shared counter or copies inline bytes, never allocating: {counts:?}"
+        );
+        assert_eq!(counts.compare, 0, "comparing reads bytes: {counts:?}");
+        assert_eq!(counts.hash, 0, "hashing reads bytes: {counts:?}");
+        assert_eq!(counts.deref, 0, "and so does a deref: {counts:?}");
+    }
+
+    // One byte past the inline capacity, the shared box appears — once.
+    let counts = counts_for("sixteen bytes!!!");
+    assert_eq!(
+        counts.from_string, 1,
+        "sixteen bytes allocate the shared box: {counts:?}"
+    );
+    assert_eq!(
+        counts.from_borrowed, 2,
+        "from a borrowed `&str`, the `String` it is copied into as well: {counts:?}"
+    );
+    assert_eq!(
+        counts.clone, 0,
+        "a clone bumps the shared counter or copies inline bytes, never allocating: {counts:?}"
+    );
+    assert_eq!(counts.compare, 0, "comparing reads bytes: {counts:?}");
+    assert_eq!(counts.hash, 0, "hashing reads bytes: {counts:?}");
+    assert_eq!(counts.deref, 0, "and so does a deref: {counts:?}");
 }

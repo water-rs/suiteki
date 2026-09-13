@@ -1,10 +1,10 @@
 [package]
 name = "suiteki"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.95"
 authors = ["Lexo Liu <me@lexo.cool>"]
-description = "A no_std string type that borrows static strings and reference-counts owned ones"
+description = "A no_std string type that stores short strings inline, borrows static ones and reference-counts owned ones"
 repository = "https://github.com/water-rs/suiteki"
 homepage = "https://github.com/water-rs/suiteki"
 documentation = "https://docs.rs/suiteki"
@@ -24,6 +24,7 @@ nami-core = { version = "0.3.3", default-features = false, optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
+suiteki_baseline = { version = "=0.1.0", package = "suiteki", features = ["serde", "nami"] }
 
 [features]
 # `std` only adds the impls that need the standard library's own types

@@ -15,46 +15,119 @@ use shared::Shared;
 use core::{
     borrow::Borrow,
     mem::{ManuallyDrop, take},
+    num::NonZeroUsize,
     ops::Deref,
-    ptr::NonNull,
+    ptr::{self, NonNull},
     slice,
 };
 
 #[cfg(feature = "nami")]
 nami_core::impl_constant!(Str);
 
-/// A string type that can be either a static reference or a ref-counted owned string.
-///
-/// `Str` combines the benefits of both `&'static str` and `String` with efficient
-/// cloning and passing, automatically using the most appropriate representation
-/// based on the source.
-pub struct Str {
-    /// Pointer to the string data.
-    ptr: NonNull<()>,
+/// The width of a machine word, in bytes.
+const WORD: usize = size_of::<usize>();
 
-    /// Length of the string in bytes.
-    /// If len >= 0, it points to a static string.
-    /// otherwise, it points to a Shared structure containing a reference-counted String,
-    len: isize,
+/// How many bytes a `Str` holds without touching the allocator: every byte of
+/// its two words except the one the tag lives in. Fifteen on a 64-bit target,
+/// seven on a 32-bit one.
+const INLINE_CAPACITY: usize = 2 * WORD - 1;
+
+/// Set in the tagged word when the bytes are stored inline.
+const INLINE_MARK: usize = 1 << (usize::BITS - 1);
+
+/// Set in the tagged word when the bytes belong to a `&'static str`.
+const STATIC_MARK: usize = 1 << (usize::BITS - 2);
+
+/// The bits of the tagged word that carry a heap length.
+const LEN_MASK: usize = STATIC_MARK - 1;
+
+/// The longest string a `Str` can describe, in bytes. Both marks are held out
+/// of the length, so this is a quarter of the address space: four exabytes on a
+/// 64-bit target, a gibibyte on a 32-bit one.
+const MAX_LEN: usize = LEN_MASK;
+
+/// The tag byte of an inline string: the mark, then the byte count.
+const INLINE_TAG: u8 = 0b1000_0000;
+
+/// The bits of the tag byte that carry the inline byte count.
+const INLINE_LEN_MASK: usize = 0b0111_1111;
+
+/// Which of the three representations a `Str` is in.
+#[derive(Clone, Copy)]
+enum Repr {
+    /// The bytes live in the `Str` itself.
+    Inline,
+    /// The bytes belong to a `&'static str`.
+    Static,
+    /// The bytes belong to a reference-counted [`Shared`].
+    Shared,
+}
+
+/// The first word of a `Str`: a data pointer, or the first inline bytes.
+///
+/// Which one it is, is what `Str::repr` answers. The inline representation
+/// initialises every byte, so reading `bytes` is only ever reading initialised
+/// memory; `ptr` is only read when a pointer is what was stored.
+#[repr(C)]
+#[derive(Clone, Copy)]
+union Payload {
+    ptr: NonNull<()>,
+    bytes: [u8; WORD],
+}
+
+/// A string type that stores short strings inline, borrows static ones and
+/// reference-counts owned ones.
+///
+/// `Str` is two words wide and never spends more than that. A borrowed `&str`
+/// of up to fifteen bytes — seven on a 32-bit target — is copied into those
+/// two words with no allocation at all; a `&'static str` is borrowed as-is;
+/// and a nonempty owned `String` is moved into a reference-counted box that
+/// keeps its buffer and capacity, so cloning it is a counter increment rather
+/// than a copy of the bytes.
+#[repr(C)]
+pub struct Str {
+    /// A data pointer, or the first `WORD` inline bytes.
+    payload: Payload,
+
+    /// The tagged word: the discriminant, plus either a length or the last
+    /// inline bytes.
+    ///
+    /// It is stored little-endian first, so that its most significant byte —
+    /// the one holding the marks — is the *last* byte of the `Str` on every
+    /// target. That is what lets the inline bytes run contiguously from the
+    /// start of the `Str` up to the tag, whatever the host's byte order.
+    ///
+    /// Every representation sets at least one bit of that byte, which is what
+    /// makes the word non-zero and keeps `Option<Str>` two words wide.
+    meta: NonZeroUsize,
 }
 
 impl Drop for Str {
     /// Decrements the reference count for owned strings and frees the memory
     /// when the reference count reaches zero.
     ///
-    /// For static strings, this is a no-op.
+    /// For inline and static strings, this is a no-op.
+    #[inline]
     fn drop(&mut self) {
-        if let Ok(shared) = self.as_shared() {
-            // SAFETY: `as_shared` returning `Ok` proves `len < 0`, so `ptr` is the
-            // leaked `Shared` box this `Str` holds a count on. `Drop` runs once, so the
-            // count is released once and the box is reclaimed only by the last owner.
+        let Some(shared) = self.as_shared() else {
+            return;
+        };
+
+        if shared.is_unique() {
+            // SAFETY: `as_shared` returning `Some` proves `ptr` is the leaked
+            // `Shared` box this `Str` holds a count on, and the borrow above has
+            // ended. `Drop` runs once, so the last owner reclaims the box once.
+            let ptr = unsafe { self.payload.ptr }.cast::<Shared>().as_ptr();
+            // SAFETY: as above; the box was leaked by `from_string`.
+            drop(unsafe { Box::from_raw(ptr) });
+        } else {
+            // SAFETY: `Shared::decrement_count` asks for an unreleased count on
+            // a live `Shared` that is not the last one. `as_shared` returning
+            // `Some` proves the allocation is live and that this `Str` owns a
+            // count on it, `is_unique` answering `false` proves the count is not
+            // the last, and `Drop` runs once, so it is released once.
             unsafe {
-                if shared.is_unique() {
-                    let ptr = self.ptr.cast::<Shared>().as_ptr();
-                    let _ = Box::from_raw(ptr);
-                } else {
-                    shared.decrement_count();
-                }
+                shared.decrement_count();
             }
         }
     }
@@ -63,20 +136,24 @@ impl Drop for Str {
 impl Clone for Str {
     /// Creates a clone of the string.
     ///
-    /// For static strings, this is a simple pointer copy.
+    /// For inline and static strings, this is a copy of the two words.
     /// For owned strings, this increments the reference count.
+    #[inline]
     fn clone(&self) -> Self {
-        if let Ok(shared) = self.as_shared() {
-            // SAFETY: `as_shared` returning `Ok` proves this is a shared string, so
-            // there is a live `Shared` to count; the clone below takes that new count.
+        if let Some(shared) = self.as_shared() {
+            // SAFETY: `Shared::increment_count` asks for an unreleased count on
+            // a live `Shared`, and that the count it creates go to exactly one
+            // new `Str`. `as_shared` returning `Some` proves this `Str` owns
+            // such a count, and the `Str` returned below is the sole taker of
+            // the new one.
             unsafe {
                 shared.increment_count();
             }
         }
 
         Self {
-            ptr: self.ptr,
-            len: self.len,
+            payload: self.payload,
+            meta: self.meta,
         }
     }
 }
@@ -85,6 +162,7 @@ impl Deref for Str {
     type Target = str;
 
     /// Provides access to the underlying string slice.
+    #[inline]
     fn deref(&self) -> &Self::Target {
         self.as_str()
     }
@@ -187,7 +265,13 @@ impl Str {
     /// Creates a `Str` from a static string slice.
     ///
     /// This method allows creating a `Str` from a string with a static lifetime,
-    /// which will be stored as a pointer to the static data without any allocation.
+    /// which will be stored as a pointer to the static data without any allocation
+    /// and without copying its bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the string is longer than a quarter of the address space, which
+    /// is the most a `Str` can describe.
     ///
     /// # Examples
     ///
@@ -199,54 +283,172 @@ impl Str {
     /// // Reference count is intentionally not exposed
     /// ```
     #[must_use]
+    #[inline]
     pub const fn from_static(s: &'static str) -> Self {
-        // SAFETY: a `&'static str` never has a null data pointer, and its non-negative
-        // length is what marks this `Str` as the static representation.
-        unsafe {
-            Self {
-                ptr: NonNull::new_unchecked(s.as_ptr().cast_mut().cast::<()>()),
-                len: s.len().cast_signed(),
-            }
+        let len = s.len();
+        assert!(len <= MAX_LEN, "a `Str` cannot describe a string this long");
+
+        // SAFETY: a `&'static str` never has a null data pointer.
+        let ptr = unsafe { NonNull::new_unchecked(s.as_ptr().cast_mut().cast::<()>()) };
+        // SAFETY: `STATIC_MARK` is set, so the word is not zero, and `to_le`
+        // maps zero to zero and everything else to something else.
+        let meta = unsafe { NonZeroUsize::new_unchecked((STATIC_MARK | len).to_le()) };
+
+        Self {
+            payload: Payload { ptr },
+            meta,
         }
     }
 
+    /// Stores the bytes of `s` followed by `suffix` in the `Str` itself.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `s` and `suffix` together are longer than `INLINE_CAPACITY`.
+    #[inline]
+    fn from_inline(s: &str, suffix: &str) -> Self {
+        let len = s
+            .len()
+            .checked_add(suffix.len())
+            .expect("inline string length overflow");
+        assert!(len <= INLINE_CAPACITY, "the string does not fit inline");
+
+        // Two fixed-width overlapping copies into the bytes of the `Str` laid
+        // end to end. Splitting them into the two words afterwards is two
+        // copies of a length the compiler knows, which is no copy at all.
+        let mut bytes = [0u8; 2 * WORD];
+        Self::copy_inline(s.as_bytes(), &mut bytes[..s.len()]);
+        Self::copy_inline(suffix.as_bytes(), &mut bytes[s.len()..len]);
+
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the assert above bounds `len` by `INLINE_CAPACITY`, at most 15"
+        )]
+        let tag = INLINE_TAG | len as u8;
+        bytes[2 * WORD - 1] = tag;
+
+        let mut head = [0u8; WORD];
+        let mut tail = [0u8; WORD];
+        head.copy_from_slice(&bytes[..WORD]);
+        tail.copy_from_slice(&bytes[WORD..]);
+
+        Self {
+            payload: Payload { bytes: head },
+            // SAFETY: the last byte carries `INLINE_TAG`, so at least one byte
+            // of the word is non-zero, whatever the host's byte order.
+            meta: unsafe { NonZeroUsize::new_unchecked(usize::from_ne_bytes(tail)) },
+        }
+    }
+
+    #[inline]
+    fn copy_inline(source: &[u8], destination: &mut [u8]) {
+        #[inline]
+        fn ends<const N: usize>(source: &[u8], destination: &mut [u8]) {
+            let end = source.len();
+            destination[..N].copy_from_slice(&source[..N]);
+            destination[end - N..end].copy_from_slice(&source[end - N..end]);
+        }
+        match source.len() {
+            0 => {}
+            1 => destination[0] = source[0],
+            2..=3 => ends::<2>(source, destination),
+            4..=7 => ends::<4>(source, destination),
+            _ => ends::<8>(source, destination),
+        }
+    }
+
+    /// Creates a `Str` holding a copy of `s`, inline when it fits.
+    #[expect(
+        clippy::inline_always,
+        reason = "keep the empty borrowed-string branch inside callers instead of an allocation-sized frame"
+    )]
+    #[inline(always)]
+    pub(crate) fn from_borrowed(s: &str) -> Self {
+        if s.is_empty() {
+            Self::new()
+        } else if s.len() <= INLINE_CAPACITY {
+            Self::from_inline(s, "")
+        } else {
+            Self::from_string(s.to_string())
+        }
+    }
+
+    #[inline(never)]
+    fn allocate_owned(string: String) -> NonNull<()> {
+        NonNull::from(Box::leak(Box::new(Shared::new(string)))).cast::<()>()
+    }
+
+    /// # Panics
+    ///
+    /// Panics if the string is longer than a quarter of the address space.
+    #[expect(
+        clippy::inline_always,
+        reason = "x86-64 cross-crate codegen otherwise outlines the empty owned-string fast path"
+    )]
+    #[inline(always)]
     fn from_string(string: String) -> Self {
         let len = string.len();
         if len == 0 {
-            // use static empty string
+            // Only empty input takes static storage; the buffer is dropped.
             return Self::new();
         }
+        assert!(len <= MAX_LEN, "a `Str` cannot describe a string this long");
 
         Self {
-            ptr: NonNull::from(Box::leak(Box::new(Shared::new(string)))).cast::<()>(),
-            len: -len.cast_signed(),
+            payload: Payload {
+                ptr: Self::allocate_owned(string),
+            },
+            // SAFETY: a shared string is nonempty, so `len` is not zero, and
+            // `to_le` keeps it that way.
+            meta: unsafe { NonZeroUsize::new_unchecked(len.to_le()) },
         }
     }
 
+    /// The tagged word, in the host's own bit order.
+    const fn tag_word(&self) -> usize {
+        usize::from_le(self.meta.get())
+    }
+
+    /// Which representation this `Str` is in.
+    const fn repr(&self) -> Repr {
+        let tag_word = self.tag_word();
+        if tag_word & (INLINE_MARK | STATIC_MARK) == 0 {
+            Repr::Shared
+        } else if tag_word & INLINE_MARK != 0 {
+            Repr::Inline
+        } else {
+            Repr::Static
+        }
+    }
+
+    /// The byte count an inline string carries in its tag byte.
+    const fn inline_len(&self) -> usize {
+        (self.tag_word() >> (usize::BITS - 8)) & INLINE_LEN_MASK
+    }
+
+    /// Whether the bytes belong to a reference-counted [`Shared`].
+    ///
+    /// This is the one question `Clone` and `Drop` ask, and neither mark being
+    /// set answers it in a single test.
     const fn is_shared(&self) -> bool {
-        self.len < 0
+        self.tag_word() & (INLINE_MARK | STATIC_MARK) == 0
     }
 
-    const fn as_shared(&self) -> Result<&Shared, &'static str> {
-        if !self.is_shared() {
-            // SAFETY: `len >= 0` is the static representation, so `ptr`/`len` describe
-            // the original `&'static str` — live for the program, and UTF-8 already.
-            return Err(unsafe {
-                core::str::from_utf8_unchecked(slice::from_raw_parts(
-                    self.ptr.as_ptr().cast(),
-                    self.len(),
-                ))
-            });
+    /// The reference-counted box, when that is what this `Str` holds.
+    const fn as_shared(&self) -> Option<&Shared> {
+        if self.is_shared() {
+            // SAFETY: the shared representation is exactly the one whose `ptr`
+            // is the leaked `Shared` this `Str` holds a count on; the borrow is
+            // tied to `&self`, which keeps that count alive.
+            Some(unsafe { self.payload.ptr.cast::<Shared>().as_ref() })
+        } else {
+            None
         }
-
-        // SAFETY: `len < 0` is the shared representation, so `ptr` is the leaked
-        // `Shared` this `Str` holds a count on; the borrow is tied to `&self`.
-        unsafe { Ok(self.ptr.cast::<Shared>().as_ref()) }
     }
 
     /// Returns a string slice of this `Str`.
     ///
-    /// This method works for both static and owned strings.
+    /// This method works for all three representations.
     ///
     /// # Examples
     ///
@@ -260,13 +462,43 @@ impl Str {
     /// assert_eq!(s2.as_str(), "world");
     /// ```
     #[must_use]
+    #[inline]
     pub const fn as_str(&self) -> &str {
-        match self.as_shared() {
-            // SAFETY: the `Shared` outlives this borrow because `self` holds a count
-            // on it.
-            Ok(shared) => unsafe { shared.as_str() },
-            Err(str) => str,
-        }
+        let (ptr, len) = match self.repr() {
+            // The inline bytes start at the first byte of the `Str` and run up
+            // to the tag byte, which is its last.
+            Repr::Inline => (ptr::from_ref(self).cast::<u8>(), self.inline_len()),
+            // SAFETY: the static representation keeps the pointer and length of
+            // the original `&'static str`, which outlives this borrow.
+            Repr::Static => (
+                unsafe { self.payload.ptr }
+                    .as_ptr()
+                    .cast_const()
+                    .cast::<u8>(),
+                self.tag_word() & LEN_MASK,
+            ),
+            Repr::Shared => {
+                // SAFETY: `as_shared_unchecked` asks for the shared
+                // representation, which the match arm establishes, and
+                // `Shared::as_str` asks for a count that outlives the returned
+                // `&str`. This `Str` owns such a count and `&self` outlives the
+                // borrow, so the allocation cannot be reclaimed while it lives.
+                return unsafe { self.as_shared_unchecked().as_str() };
+            }
+        };
+
+        // SAFETY: `ptr` and `len` describe the bytes this `Str` was built from,
+        // which were UTF-8 already, and which live at least as long as `&self`.
+        unsafe { core::str::from_utf8_unchecked(slice::from_raw_parts(ptr, len)) }
+    }
+
+    /// # Safety
+    ///
+    /// This `Str` must be in the shared representation.
+    const unsafe fn as_shared_unchecked(&self) -> &Shared {
+        // SAFETY: the caller guarantees the shared representation, whose `ptr`
+        // is the leaked `Shared` this `Str` holds a count on.
+        unsafe { self.payload.ptr.cast::<Shared>().as_ref() }
     }
 
     /// Returns the length of the string, in bytes.
@@ -280,7 +512,11 @@ impl Str {
     /// ```
     #[must_use]
     pub const fn len(&self) -> usize {
-        self.len.unsigned_abs()
+        if self.tag_word() & INLINE_MARK != 0 {
+            self.inline_len()
+        } else {
+            self.tag_word() & LEN_MASK
+        }
     }
 
     /// Returns `true` if the string has a length of zero.
@@ -303,9 +539,9 @@ impl Str {
 
     /// Converts this `Str` into a `String`.
     ///
-    /// For static strings, this will allocate a new string and copy the contents.
-    /// For owned strings, this will attempt to take ownership of the string if the reference
-    /// count is 1, or create a new copy otherwise.
+    /// For inline and static strings, this will allocate a new string and copy
+    /// the contents. For owned strings, this will take ownership of the string
+    /// if this is the last reference, and copy it otherwise.
     ///
     /// # Examples
     ///
@@ -316,20 +552,30 @@ impl Str {
     /// let s1_string = s1.into_string();
     /// assert_eq!(s1_string, "static");
     ///
-    /// let s2 = Str::from(String::from("owned"));
+    /// let s2 = Str::from(String::from("an owned, heap-sized string"));
     /// let s2_string = s2.into_string();
-    /// assert_eq!(s2_string, "owned");
+    /// assert_eq!(s2_string, "an owned, heap-sized string");
     /// ```
     #[must_use]
+    #[inline]
     pub fn into_string(self) -> String {
         let this = ManuallyDrop::new(self);
         match this.as_shared() {
-            // SAFETY: `self` is wrapped in `ManuallyDrop`, so its count is not released
-            // twice. When unique, this is the last owner and may reclaim the box;
-            // otherwise it drops its own count and copies the contents.
-            Ok(shared) => unsafe {
+            // SAFETY: `self` is wrapped in `ManuallyDrop`, so the count it owns
+            // is released exactly once, here, and `as_shared` returning `Some`
+            // proves this `Str` holds a count on a live `Shared` allocation.
+            // In the unique branch, `Shared::take` asks for the last count and
+            // for the leaked box to have been reclaimed: `is_unique` answered
+            // `true` and `Box::from_raw` takes back what `from_string` leaked.
+            // In the other branch, `Shared::decrement_count` asks for an
+            // unreleased count that is not the last, which `is_unique`
+            // answering `false` proves, and `Shared::as_str` asks for a count
+            // that outlives the borrow, which the owner that same answer
+            // proves still exists holds for as long as the bytes are copied
+            // out.
+            Some(shared) => unsafe {
                 if shared.is_unique() {
-                    let shared = Box::from_raw(this.ptr.cast::<Shared>().as_ptr());
+                    let shared = Box::from_raw(this.payload.ptr.cast::<Shared>().as_ptr());
 
                     shared.take()
                 } else {
@@ -337,7 +583,7 @@ impl Str {
                     shared.as_str().to_string()
                 }
             },
-            Err(str) => str.to_string(),
+            None => this.as_str().to_string(),
         }
     }
 }
@@ -357,6 +603,7 @@ impl Str {
     /// // Reference count is intentionally not exposed
     /// ```
     #[must_use]
+    #[inline]
     pub const fn new() -> Self {
         Self::from_static("")
     }
@@ -385,6 +632,7 @@ impl Str {
     /// let invalid = vec![0xFF, 0xFF];
     /// assert!(Str::from_utf8(invalid).is_err());
     /// ```
+    #[inline]
     pub fn from_utf8(bytes: Vec<u8>) -> Result<Self, FromUtf8Error> {
         String::from_utf8(bytes).map(Self::from)
     }
@@ -421,6 +669,46 @@ impl Str {
         *self = Self::from(string);
     }
 
+    fn extend_parts<S: AsRef<str>>(&mut self, iter: impl IntoIterator<Item = S>) {
+        fn extend_string<S: AsRef<str>>(string: &mut String, iter: impl Iterator<Item = S>) {
+            for part in iter {
+                string.push_str(part.as_ref());
+            }
+        }
+        let mut iter = iter.into_iter().peekable();
+        if iter.peek().is_none() {
+            return;
+        }
+        if self.is_shared() || self.len() > INLINE_CAPACITY {
+            self.handle(|string| extend_string(string, iter));
+            return;
+        }
+        let mut bytes = [0u8; INLINE_CAPACITY];
+        let mut len = self.len();
+        bytes[..len].copy_from_slice(self.as_bytes());
+        while let Some(part) = iter.next() {
+            let part = part.as_ref();
+            if part.len() <= INLINE_CAPACITY - len {
+                let end = len + part.len();
+                Self::copy_inline(part.as_bytes(), &mut bytes[len..end]);
+                len = end;
+            } else {
+                let total = len.checked_add(part.len()).expect("string length overflow");
+                let prefix =
+                    core::str::from_utf8(&bytes[..len]).expect("concatenated UTF-8 strings");
+                let mut string = String::with_capacity(total);
+                string.push_str(prefix);
+                string.push_str(part);
+                extend_string(&mut string, iter);
+                *self = Self::from(string);
+                return;
+            }
+        }
+        *self = Self::from_borrowed(
+            core::str::from_utf8(&bytes[..len]).expect("concatenated UTF-8 strings"),
+        );
+    }
+
     /// Appends a string to this `Str`.
     ///
     /// This method will convert the `Str` to an owned string if it's a static reference.
@@ -435,9 +723,20 @@ impl Str {
     /// assert_eq!(s, "hello world");
     /// ```
     pub fn append(&mut self, s: impl AsRef<str>) {
-        let mut string = take(self).into_string();
-        string.push_str(s.as_ref());
-        *self = Self::from(string);
+        let s = s.as_ref();
+        if s.is_empty() {
+            return;
+        }
+        if !self.is_shared()
+            && self
+                .len()
+                .checked_add(s.len())
+                .is_some_and(|len| len <= INLINE_CAPACITY)
+        {
+            *self = Self::from_inline(self.as_str(), s);
+        } else {
+            self.handle(|string| string.push_str(s));
+        }
     }
 }
 impl From<&'static str> for Str {
@@ -454,6 +753,7 @@ impl From<&'static str> for Str {
     /// assert_eq!(s, "hello");
     /// // Reference count is intentionally not exposed
     /// ```
+    #[inline]
     fn from(value: &'static str) -> Self {
         Self::from_static(value)
     }
@@ -462,7 +762,8 @@ impl From<&'static str> for Str {
 impl From<String> for Str {
     /// Creates a `Str` from an owned `String`.
     ///
-    /// This will store the string in a reference-counted container.
+    /// The string keeps its own buffer inside a reference-counted box, so its
+    /// capacity survives; only an empty `String` takes static storage.
     ///
     /// # Examples
     ///
@@ -473,6 +774,7 @@ impl From<String> for Str {
     /// assert_eq!(s, "hello");
     /// // Reference count is intentionally not exposed
     /// ```
+    #[inline]
     fn from(value: String) -> Self {
         Self::from_string(value)
     }
@@ -488,6 +790,192 @@ impl From<Str> for String {
 mod tests {
     use super::*;
     use alloc::vec;
+
+    /// A hasher that just records the bytes it is fed, so the tests can compare
+    /// what two `Str`s hash *from* without pulling in `std`'s `DefaultHasher`.
+    #[derive(Default)]
+    struct Recorder(alloc::vec::Vec<u8>);
+
+    impl core::hash::Hasher for Recorder {
+        fn write(&mut self, bytes: &[u8]) {
+            self.0.extend_from_slice(bytes);
+        }
+
+        fn finish(&self) -> u64 {
+            self.0.iter().fold(0u64, |acc, &b| {
+                acc.wrapping_mul(31).wrapping_add(u64::from(b))
+            })
+        }
+    }
+
+    fn hash_of(value: &Str) -> u64 {
+        use core::hash::{Hash, Hasher};
+        let mut hasher = Recorder::default();
+        value.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// The three representations of the same text, for the tests that require
+    /// all of them to be indistinguishable.
+    fn every_representation(text: &'static str) -> [Str; 3] {
+        [
+            Str::from_static(text),
+            Str::from(String::from(text)),
+            Str::from_borrowed(text),
+        ]
+    }
+
+    #[test]
+    fn a_str_is_two_words_wide() {
+        assert_eq!(size_of::<Str>(), 2 * size_of::<usize>());
+        assert_eq!(align_of::<Str>(), align_of::<usize>());
+        // The tagged word is never zero, so the niche is still there and an
+        // `Option<Str>` costs nothing over a `Str`.
+        assert_eq!(size_of::<Option<Str>>(), size_of::<Str>());
+    }
+
+    #[test]
+    fn a_static_string_is_still_a_constant() {
+        // The length check `from_static` makes is evaluated at compile time for
+        // a literal, which is what keeps `Str::from("...")` free in real code
+        // even though the benchmark's opaque length has to pay for it.
+        const GREETING: Str = Str::from_static("hello");
+        assert_eq!(GREETING.as_str(), "hello");
+        assert_eq!(GREETING.len(), 5);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn sixteen_bytes_hold_fifteen() {
+        assert_eq!(size_of::<Str>(), 16);
+        assert_eq!(INLINE_CAPACITY, 15);
+    }
+
+    #[test]
+    fn empty_construction_uses_static_storage() {
+        for value in [
+            Str::new(),
+            Str::from_borrowed(""),
+            Str::from(String::new()),
+            Str::from(String::with_capacity(64)),
+            Str::from_utf8(Vec::with_capacity(64)).unwrap(),
+        ] {
+            assert!(matches!(value.repr(), Repr::Static));
+            assert!(value.is_empty());
+            assert_eq!(value.as_str(), "");
+        }
+    }
+
+    #[test]
+    fn borrowed_strings_use_static_empty_or_inline_storage() {
+        for len in 0..=INLINE_CAPACITY {
+            let text: String = "abcdefghijklmno".chars().take(len).collect();
+            let inline = Str::from_borrowed(&text);
+
+            if len == 0 {
+                assert!(matches!(inline.repr(), Repr::Static));
+            } else {
+                assert!(matches!(inline.repr(), Repr::Inline), "{len} bytes");
+            }
+            assert_eq!(inline.as_str(), text, "{len} bytes");
+            assert_eq!(inline.len(), len, "{len} bytes");
+            assert_eq!(inline.is_empty(), len == 0, "{len} bytes");
+        }
+    }
+
+    #[test]
+    fn one_byte_past_the_capacity_is_shared() {
+        let text = "abcdefghijklmnopqrstuvwxyz"
+            .chars()
+            .take(INLINE_CAPACITY + 1)
+            .collect::<String>();
+        let shared = Str::from(text.clone());
+
+        assert!(matches!(shared.repr(), Repr::Shared));
+        assert_eq!(shared.as_str(), text);
+        assert_eq!(shared.len(), INLINE_CAPACITY + 1);
+        // Cloning a shared string still shares the bytes.
+        assert_eq!(shared.clone().as_str().as_ptr(), shared.as_str().as_ptr());
+    }
+
+    #[test]
+    fn a_static_string_stays_borrowed_whatever_its_length() {
+        let short = Str::from_static("short");
+        let long = Str::from_static("a string that is well past the inline capacity");
+
+        assert!(matches!(short.repr(), Repr::Static));
+        assert!(matches!(long.repr(), Repr::Static));
+        assert_eq!(short.as_str().as_ptr(), "short".as_ptr());
+    }
+
+    #[test]
+    fn the_representation_does_not_change_what_a_str_is() {
+        for text in [
+            "",
+            "x",
+            "fifteen bytes!!",
+            "sixteen bytes!!!",
+            "a much longer string",
+        ] {
+            let [borrowed, owned, copied] = every_representation(text);
+
+            assert_eq!(borrowed, owned);
+            assert_eq!(owned, copied);
+            assert_eq!(borrowed.as_str(), text);
+            assert_eq!(copied.as_str(), text);
+            assert_eq!(borrowed.len(), text.len());
+            assert_eq!(owned.len(), text.len());
+            assert_eq!(copied.len(), text.len());
+            assert_eq!(hash_of(&borrowed), hash_of(&owned));
+            assert_eq!(hash_of(&owned), hash_of(&copied));
+            assert_eq!(borrowed.cmp(&owned), core::cmp::Ordering::Equal);
+            assert_eq!(borrowed.clone().into_string(), text);
+            assert_eq!(owned.clone().into_string(), text);
+            assert_eq!(copied.clone().into_string(), text);
+        }
+    }
+
+    #[test]
+    fn an_inline_string_survives_being_moved() {
+        // The inline bytes live in the `Str` itself, so anything that moves one
+        // has to keep reading the right bytes afterwards.
+        let mut moved = vec![Str::from_borrowed("inline!")];
+        for i in 0..64 {
+            let mut text = String::from("n");
+            text.push_str(&i.to_string());
+            moved.push(Str::from_borrowed(&text));
+        }
+        moved.rotate_left(7);
+        let boxed = moved.into_boxed_slice();
+
+        assert_eq!(boxed[boxed.len() - 7].as_str(), "inline!");
+        assert_eq!(boxed[boxed.len() - 6].as_str(), "n0");
+    }
+
+    #[test]
+    fn appending_crosses_the_boundary_in_both_directions() {
+        let mut s = Str::from_borrowed("inline");
+        assert!(matches!(s.repr(), Repr::Inline));
+
+        s.append(" and then some more bytes");
+        assert!(matches!(s.repr(), Repr::Shared));
+        assert_eq!(s.as_str(), "inline and then some more bytes");
+
+        let mut back = Str::from_borrowed(&s.as_str()[..6]);
+        assert!(matches!(back.repr(), Repr::Inline));
+        back.append("");
+        assert_eq!(back.as_str(), "inline");
+    }
+
+    #[test]
+    fn a_long_string_is_still_a_string() {
+        // Well past every tag bit, so a length that leaked into the tag would
+        // show up here.
+        let text = "x".repeat(1 << 20);
+        let s = Str::from(text.clone());
+        assert_eq!(s.len(), text.len());
+        assert_eq!(s.as_str(), text);
+    }
 
     #[test]
     fn test_static_string_creation() {
@@ -652,14 +1140,247 @@ mod tests {
     #[test]
     fn test_memory_safety_clone_drop_cycles() {
         // Test multiple clone/drop cycles to ensure no memory leaks or double-frees
-        for _ in 0..100 {
-            let s1 = Str::from(String::from("test"));
-            let s2 = s1.clone();
-            let s3 = s2.clone();
+        for text in ["test", "a heap string long enough to remain shared"] {
+            for _ in 0..100 {
+                let s1 = Str::from(String::from(text));
+                let s2 = s1.clone();
+                let s3 = s2.clone();
 
-            drop(s1);
-            drop(s3);
-            drop(s2);
+                drop(s1);
+                drop(s3);
+                drop(s2);
+            }
+        }
+    }
+
+    #[test]
+    fn every_inline_length_survives_offset_input_and_moves() {
+        for len in 0..=INLINE_CAPACITY + 1 {
+            for offset in 0..WORD {
+                let text = "q".repeat(offset + len + 1).into_boxed_str();
+                let input = &text[offset..offset + len];
+                let value = Str::from_borrowed(input);
+                let mut values = vec![None, Some(value.clone()), Some(value)];
+                values.rotate_left(1);
+                let boxed = values.into_boxed_slice();
+                drop(text);
+                for value in boxed.iter().flatten() {
+                    assert_eq!(value.as_str(), "q".repeat(len));
+                    assert_eq!(value.len(), len);
+                    assert_eq!(value.clone().into_string(), "q".repeat(len));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn utf8_boundaries_and_nuls_survive_ownership_transitions() {
+        for scalar in ["\0", "é", "界", "\u{1f642}"] {
+            for padding in 0..=INLINE_CAPACITY + 1 {
+                let text = "x".repeat(padding) + scalar;
+                for mut value in [
+                    Str::from_utf8(text.as_bytes().to_vec()).unwrap(),
+                    Str::from_borrowed(&text),
+                ] {
+                    let alias = value.clone();
+                    value.append(scalar);
+                    assert_eq!(alias.as_str(), text);
+                    assert_eq!(alias.len(), text.len());
+                    assert_eq!(value.as_str(), text.clone() + scalar);
+                    drop(value);
+                    assert_eq!(alias.into_string(), text);
+                }
+            }
+        }
+        for bytes in [
+            vec![0xc0, 0x80],
+            vec![0xed, 0xa0, 0x80],
+            vec![0xf4, 0x90, 0x80, 0x80],
+            vec![0xe2, 0x82],
+        ] {
+            let mut input = vec![b'x'; INLINE_CAPACITY];
+            input.extend(bytes);
+            let error = Str::from_utf8(input.clone()).unwrap_err();
+            assert_eq!(error.into_bytes(), input);
+        }
+    }
+
+    #[test]
+    fn heap_aliases_survive_every_three_owner_release_order() {
+        let text = "shared".repeat(INLINE_CAPACITY + 1);
+        for order in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            for convert in 0..8 {
+                let value = Str::from(text.clone());
+                let pointer = value.as_str().as_ptr();
+                let mut owners = [Some(value.clone()), Some(value.clone()), Some(value)];
+                for (step, index) in order.into_iter().enumerate() {
+                    let owner = owners[index].take().unwrap();
+                    if convert & (1 << step) == 0 {
+                        drop(owner);
+                    } else {
+                        let string = owner.into_string();
+                        assert_eq!(string, text);
+                        if step == 2 {
+                            assert_eq!(string.as_ptr(), pointer);
+                        } else {
+                            assert_ne!(string.as_ptr(), pointer);
+                        }
+                    }
+                    for survivor in owners.iter().flatten() {
+                        assert_eq!(survivor.as_str(), text);
+                        assert_eq!(survivor.as_str().as_ptr(), pointer);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn heap_mutation_detaches_and_preserves_reserved_capacity() {
+        let text = "a".repeat(INLINE_CAPACITY + 1);
+        let mut string = String::with_capacity(text.len() + 128);
+        string.push_str(&text);
+        let pointer = string.as_ptr();
+        let capacity = string.capacity();
+        let mut unique = Str::from(string);
+        unique.append("tail");
+        let string = unique.into_string();
+        assert_eq!(string.as_ptr(), pointer);
+        assert_eq!(string.capacity(), capacity);
+        let mut shared = Str::from(string);
+        let original = shared.clone();
+        shared += "suffix";
+        assert_eq!(original.as_str(), text.clone() + "tail");
+        assert_eq!(shared.as_str(), text + "tailsuffix");
+        drop(shared);
+        let string = original.into_string();
+        assert_eq!(string.as_ptr(), pointer);
+    }
+
+    #[test]
+    fn iterator_unwind_keeps_alias_and_receiver_valid() {
+        extern crate std;
+        for text in ["short", "a long shared string beyond inline"] {
+            for mut value in every_representation(text) {
+                let alias = value.clone();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    value.extend(["first", "second"].into_iter().inspect(|&part| {
+                        assert_ne!(part, "second", "iterator panic");
+                    }));
+                }));
+                assert!(result.is_err());
+                assert_eq!(alias.as_str(), text);
+                assert_eq!(value.len(), value.as_str().len());
+                value.append("after unwind");
+                assert!(value.as_str().ends_with("after unwind"));
+                drop(alias);
+            }
+        }
+    }
+
+    #[test]
+    fn empty_extend_preserves_shared_buffer_and_aliases() {
+        let mut value = Str::from(String::from("short"));
+        let alias = value.clone();
+        let pointer = value.as_str().as_ptr();
+        value.extend(core::iter::empty::<&str>());
+        value.extend(core::iter::empty::<String>());
+        value.extend(core::iter::empty::<Str>());
+        assert_eq!(value.as_str().as_ptr(), pointer);
+        assert_eq!(value, alias);
+    }
+
+    #[test]
+    fn owned_strings_preserve_buffers_at_every_inline_boundary() {
+        for len in 1..=INLINE_CAPACITY + 1 {
+            let mut string = String::with_capacity(INLINE_CAPACITY * 4);
+            string.push_str(&"x".repeat(len));
+            let pointer = string.as_ptr();
+            let capacity = string.capacity();
+            let mut value = Str::from(string);
+            assert!(matches!(value.repr(), Repr::Shared));
+            assert_eq!(value.as_str().as_ptr(), pointer);
+            let alias = value.clone();
+            let copied = alias.into_string();
+            assert_eq!(copied, "x".repeat(len));
+            assert_ne!(copied.as_ptr(), pointer);
+            value.append("y");
+            let string = value.into_string();
+            assert_eq!(string, "x".repeat(len) + "y");
+            assert_eq!(string.as_ptr(), pointer);
+            assert_eq!(string.capacity(), capacity);
+        }
+    }
+
+    #[test]
+    fn equal_addresses_do_not_make_different_lengths_equal() {
+        let text = "same allocation, different lengths";
+        let full = Str::from_static(text);
+        let prefix = Str::from_static(&text[..4]);
+        assert_eq!(full.as_str().as_ptr(), prefix.as_str().as_ptr());
+        assert_ne!(full, prefix);
+        assert_eq!(full, full.clone());
+        assert_eq!(Str::from_borrowed(""), Str::new());
+    }
+
+    #[test]
+    fn mutation_traits_match_string_across_representations() {
+        for text in [
+            "",
+            "x",
+            "é水",
+            "a long heap string past the inline boundary",
+        ] {
+            for value in every_representation(text) {
+                let suffixes = ["", "a", "é", "an appended heap string"];
+                let expected = String::from(text) + &suffixes.concat();
+                let mut by_append = value.clone();
+                let mut by_assign = value.clone();
+                let mut by_extend = value.clone();
+                let mut by_owned = value.clone();
+                let mut by_str = value.clone();
+                for suffix in suffixes {
+                    by_append.append(suffix);
+                    by_assign += suffix;
+                }
+                by_extend.extend(suffixes);
+                by_owned.extend(suffixes.map(String::from));
+                by_str.extend(suffixes.map(Str::from_static));
+                for result in [by_append, by_assign, by_extend, by_owned, by_str] {
+                    assert_eq!(result.as_str(), expected);
+                    assert_eq!(result.len(), expected.len());
+                }
+                assert_eq!((&value + "tail").as_str(), String::from(text) + "tail");
+                assert_eq!(value.as_str(), text);
+            }
+        }
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serde_owned_and_borrowed_inputs_keep_their_storage_contracts() {
+        use serde::{
+            Deserialize,
+            de::value::{Error, StrDeserializer, StringDeserializer},
+        };
+        for text in ["", "short", "a long heap string past the inline boundary"] {
+            let borrowed = Str::deserialize(StrDeserializer::<Error>::new(text)).unwrap();
+            let string = String::from(text);
+            let pointer = string.as_ptr();
+            let owned = Str::deserialize(StringDeserializer::<Error>::new(string)).unwrap();
+            assert_eq!(borrowed.as_str(), text);
+            assert_eq!(owned.as_str(), text);
+            if !text.is_empty() {
+                assert_eq!(owned.as_str().as_ptr(), pointer);
+            }
+            assert_eq!(owned, borrowed);
         }
     }
 
@@ -897,8 +1618,11 @@ mod tests {
 
     #[test]
     fn test_memory_safety_ptr_stability() {
-        // Ensure string content pointer remains stable across clones
-        let s1 = Str::from(String::from("stable"));
+        // Ensure string content pointer remains stable across clones. Sharing
+        // the bytes is what the reference-counted representation is for, and
+        // owning a `String` — not the string's length — is what puts one in
+        // it: an inline string is copied by a clone, and copies are the point.
+        let s1 = Str::from(String::from("a stable, heap-sized allocation"));
         let ptr1 = s1.as_str().as_ptr();
 
         let s2 = s1.clone();
