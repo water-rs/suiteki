@@ -125,10 +125,39 @@ fn access(c: &mut Criterion) {
         });
     });
 
-    bench_lengths(c, "str/to_string", |b, len| {
+    let mut group = c.benchmark_group("str");
+    for len in LENGTHS {
+        if len > 0 {
+            group.throughput(Throughput::Bytes(len as u64));
+        }
         let value = Str::from(String::from(static_str(len)));
-        b.iter(|| black_box(&value).to_string());
-    });
+        let pointer = value.as_str().as_ptr();
+        group.bench_with_input(BenchmarkId::new("to_string", len), &len, |b, _| {
+            b.iter(|| black_box(&value).to_string());
+        });
+        group.bench_with_input(
+            BenchmarkId::new("to_string_direct_copy", len),
+            &len,
+            |b, _| {
+                b.iter(|| black_box(black_box(&value).as_str()).to_owned());
+            },
+        );
+        let buffer = value.into_string();
+        assert_eq!(buffer.as_ptr(), pointer);
+        let baseline = suiteki_baseline::Str::from(buffer);
+        assert_eq!(baseline.as_str().as_ptr(), pointer);
+        group.bench_with_input(BenchmarkId::new("baseline_to_string", len), &len, |b, _| {
+            b.iter(|| black_box(&baseline).to_string());
+        });
+        group.bench_with_input(
+            BenchmarkId::new("baseline_to_string_direct_copy", len),
+            &len,
+            |b, _| {
+                b.iter(|| black_box(black_box(&baseline).as_str()).to_owned());
+            },
+        );
+    }
+    group.finish();
 }
 
 fn ownership(c: &mut Criterion) {
