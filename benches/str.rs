@@ -376,10 +376,16 @@ fn constructor_pairs(c: &mut Criterion) {
         let current = Str::from(source.clone());
         let baseline = suiteki_baseline::Str::from(source.clone());
         group.bench_function(BenchmarkId::new("current_as_str", len), |b| {
-            b.iter(|| black_box(&current).as_str().len());
+            b.iter(|| {
+                let slice = black_box(&current).as_str();
+                slice.len() + usize::from(slice.as_bytes().last().copied().unwrap_or(0))
+            });
         });
         group.bench_function(BenchmarkId::new("baseline_as_str", len), |b| {
-            b.iter(|| black_box(&baseline).as_str().len());
+            b.iter(|| {
+                let slice = black_box(&baseline).as_str();
+                slice.len() + usize::from(slice.as_bytes().last().copied().unwrap_or(0))
+            });
         });
     }
     group.finish();
