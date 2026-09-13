@@ -1,13 +1,13 @@
 //! Pins how many allocations each construction path is allowed to make.
 //!
-//! The whole point of `Str` is which of these numbers are zero: a string that
-//! fits inline never reaches the allocator at all, a static string never
-//! reaches it either, and a longer owned one reaches it exactly once, for the
-//! reference-counted box. Clones, comparisons, hashes and derefs never allocate
-//! whatever the representation. Those are claims about behaviour, not about
-//! wall-clock time, so they belong in a test rather than in the benchmarks —
-//! and they are what keeps the small-string optimization from being undone by
-//! accident.
+//! The whole point of `Str` is which of these numbers are zero: a borrowed
+//! copy that fits inline never reaches the allocator at all, a static string
+//! never reaches it either, and any nonempty owned one reaches it exactly once,
+//! for the reference-counted box. Clones, comparisons, hashes and derefs never
+//! allocate whatever the representation. Those are claims about behaviour, not
+//! about wall-clock time, so they belong in a test rather than in the
+//! benchmarks — and they are what keeps the small-string optimization from
+//! being undone by accident.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::hash_map::DefaultHasher;
@@ -109,10 +109,64 @@ fn construction_allocates_only_where_it_has_to() {
         "the last reference hands its `String` back without copying"
     );
 
+    let capacity = 2 * size_of::<usize>() - 1;
+    for len in 0..=capacity {
+        let text = "x".repeat(len);
+        let (count, value) = allocations_during(|| Str::from_str(black_box(&text)).unwrap());
+        assert_eq!(count, 0);
+        assert_eq!(value.as_str(), text);
+        let mut value = value;
+        let suffix = "y".repeat(capacity - len);
+        let (count, ()) = allocations_during(|| value.append(black_box(&suffix)));
+        assert_eq!(count, 0);
+        assert_eq!(value.as_str(), text + &suffix);
+    }
+    let pieces = vec!["x"; capacity];
+    let (count, collected) =
+        allocations_during(|| black_box(&pieces).iter().copied().collect::<Str>());
+    assert_eq!(count, 0);
+    assert_eq!(collected.as_str(), "x".repeat(capacity));
+    let mut extended = Str::new();
+    let (count, ()) = allocations_during(|| extended.extend(black_box(&pieces).iter().copied()));
+    assert_eq!(count, 0);
+    assert_eq!(extended, collected);
+    let pieces = vec!["x"; capacity + 1];
+    let (count, collected) =
+        allocations_during(|| black_box(&pieces).iter().copied().collect::<Str>());
+    assert_eq!(count, 2);
+    assert_eq!(collected.as_str(), "x".repeat(capacity + 1));
+    for mut value in [
+        Str::from_static("static"),
+        Str::from(String::from("a heap string longer than the inline limit")),
+    ] {
+        let alias = value.clone();
+        let pointer = value.as_str().as_ptr();
+        let (count, ()) = allocations_during(|| value.append(black_box("")));
+        assert_eq!(count, 0);
+        assert_eq!(value.as_str().as_ptr(), pointer);
+        assert_eq!(value, alias);
+    }
+    for len in 1..=capacity {
+        let mut source = String::with_capacity(capacity * 4);
+        source.push_str(&"x".repeat(len));
+        let pointer = source.as_ptr();
+        let size = source.capacity();
+        let (count, value) = allocations_during(|| Str::from(black_box(source)));
+        assert_eq!(count, 1);
+        assert_eq!(value.as_str().as_ptr(), pointer);
+        let (count, alias) = allocations_during(|| value.clone());
+        assert_eq!(count, 0);
+        drop(alias);
+        let (count, string) = allocations_during(|| value.into_string());
+        assert_eq!(count, 0);
+        assert_eq!(string.as_ptr(), pointer);
+        assert_eq!(string.capacity(), size);
+    }
+
     // Not a `#[test]` of its own: the counter is process-global and the harness
     // would run two tests on two threads at once.
     #[cfg(target_pointer_width = "64")]
-    short_strings_never_reach_the_allocator();
+    short_borrowed_strings_never_reach_the_allocator();
 }
 
 /// What one string cost, on every path that has an opinion about allocation.
@@ -168,15 +222,14 @@ fn counts_for(text: &str) -> Counts {
 /// on a 32-bit one the same reasoning holds at seven, so the exact numbers are
 /// only asserted where they are the right ones.
 #[cfg(target_pointer_width = "64")]
-fn short_strings_never_reach_the_allocator() {
+fn short_borrowed_strings_never_reach_the_allocator() {
     for text in ["", "x", "fifteen bytes!!"] {
         assert!(text.len() <= 15, "{text:?} is not a short string");
         let counts = counts_for(text);
         assert_eq!(
             counts.from_string,
-            0,
-            "a {}-byte string fits inline: {counts:?}",
-            text.len()
+            usize::from(!text.is_empty()),
+            "a nonempty owned string keeps its buffer in one shared box: {counts:?}"
         );
         assert_eq!(
             counts.from_borrowed, 0,
@@ -184,7 +237,7 @@ fn short_strings_never_reach_the_allocator() {
         );
         assert_eq!(
             counts.clone, 0,
-            "cloning inline bytes copies them: {counts:?}"
+            "a clone bumps the shared counter or copies inline bytes, never allocating: {counts:?}"
         );
         assert_eq!(counts.compare, 0, "comparing reads bytes: {counts:?}");
         assert_eq!(counts.hash, 0, "hashing reads bytes: {counts:?}");
@@ -203,7 +256,7 @@ fn short_strings_never_reach_the_allocator() {
     );
     assert_eq!(
         counts.clone, 0,
-        "cloning a shared string bumps a counter: {counts:?}"
+        "a clone bumps the shared counter or copies inline bytes, never allocating: {counts:?}"
     );
     assert_eq!(counts.compare, 0, "comparing reads bytes: {counts:?}");
     assert_eq!(counts.hash, 0, "hashing reads bytes: {counts:?}");

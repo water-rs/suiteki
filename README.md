@@ -9,14 +9,14 @@ reference-counts owned ones.
 `Str` is two words wide — sixteen bytes on a 64-bit target — and never spends
 more than that. It stores one of three things:
 
-- **Inline.** Up to fifteen bytes (seven on a 32-bit target) live in the `Str`
-  itself. Nothing is allocated, cloning copies the two words, and there is no
-  pointer to follow to read the text.
+- **Inline.** A borrowed `&str` of up to fifteen bytes (seven on a 32-bit
+  target) is copied into the `Str` itself. Nothing is allocated, cloning
+  copies the two words, and there is no pointer to follow to read the text.
 - **Borrowed.** A `&'static str` is kept as-is: no allocation, and cloning is a
   pointer copy, whatever its length.
-- **Shared.** A longer `String` is moved into a reference-counted box: one
-  allocation, and cloning is a counter increment rather than a copy of the
-  bytes.
+- **Shared.** Any nonempty `String` is moved into a reference-counted box that
+  keeps its buffer and capacity: one allocation, and cloning is a counter
+  increment rather than a copy of the bytes.
 
 The discriminant is packed into the two top bits of the length word, whose most
 significant byte is the last byte of the `Str` — the byte the inline bytes stop
@@ -37,8 +37,8 @@ let greeting = Str::from("hello");
 assert_eq!(greeting.len(), 5);
 assert!(greeting.starts_with("hello"));
 
-// A short string is stored in the `Str` itself, so this allocates nothing.
-let inline = Str::from(String::from("world"));
+// A short borrowed copy stays inline without allocating.
+let inline = "world".parse::<Str>().unwrap();
 assert_eq!(inline, "world");
 
 // A longer one is refcounted, so this clone copies no bytes.
@@ -52,7 +52,7 @@ assert_eq!(combined, "hello world");
 ```
 
 Empty strings never reach the allocator, however they are built, and neither
-does anything else that fits inline:
+do borrowed copies that fit inline:
 
 ```rust
 use suiteki::Str;
@@ -62,7 +62,8 @@ assert!(Str::from("").is_empty());
 assert!(Str::from(String::new()).is_empty());
 ```
 
-`into_string` takes the allocation back when this is the last reference, and
+`into_string` allocates a fresh `String` for inline and static strings; for an
+owned one it takes the allocation back when this is the last reference, and
 copies only when it is not:
 
 ```rust
@@ -108,8 +109,12 @@ cargo bench --all-features
 ```
 
 The suite covers construction from a `&'static str`, from a `String` and from a
-borrowed `&str`, plus clone, deref, equality, hashing and `to_string`, at byte
-lengths from 0 to 4096, bracketing the inline boundary at 15, 16 and 17.
+borrowed `&str`; clone, deref, equality, hashing and `to_string`; ownership
+lifecycles including shared aliases, `into_string` round trips and reserved
+capacity; every representation across clone, access and drop; equality against
+aliases and first/last-byte mismatches; Unicode, NUL and `Display` formatting;
+and `collect`/`extend` concatenation — at byte lengths from 0 to 4096,
+bracketing the inline boundary on both 32- and 64-bit targets.
 `tests/allocations.rs` pins the allocation counts those paths are allowed to
 make.
 
