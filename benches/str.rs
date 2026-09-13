@@ -342,6 +342,49 @@ fn text_inputs(c: &mut Criterion) {
     concatenate.finish();
 }
 
+fn constructor_pairs(c: &mut Criterion) {
+    let mut group = c.benchmark_group("constructor_pair");
+    for len in [0, 15, 4096] {
+        let text = static_str(len);
+        let source = String::from(text);
+        group.bench_function(BenchmarkId::new("current_from_static", len), |b| {
+            b.iter(|| Str::from_static(black_box(text)));
+        });
+        group.bench_function(BenchmarkId::new("baseline_from_static", len), |b| {
+            b.iter(|| suiteki_baseline::Str::from_static(black_box(text)));
+        });
+        group.bench_function(BenchmarkId::new("current_from_string", len), |b| {
+            b.iter_batched(
+                || source.clone(),
+                |owned| Str::from(black_box(owned)),
+                BATCH,
+            );
+        });
+        group.bench_function(BenchmarkId::new("baseline_from_string", len), |b| {
+            b.iter_batched(
+                || source.clone(),
+                |owned| suiteki_baseline::Str::from(black_box(owned)),
+                BATCH,
+            );
+        });
+        group.bench_function(BenchmarkId::new("current_from_borrowed", len), |b| {
+            b.iter(|| Str::from_str(black_box(source.as_str())).unwrap());
+        });
+        group.bench_function(BenchmarkId::new("baseline_from_borrowed", len), |b| {
+            b.iter(|| suiteki_baseline::Str::from_str(black_box(source.as_str())).unwrap());
+        });
+        let current = Str::from(source.clone());
+        let baseline = suiteki_baseline::Str::from(source.clone());
+        group.bench_function(BenchmarkId::new("current_as_str", len), |b| {
+            b.iter(|| black_box(&current).as_str().len());
+        });
+        group.bench_function(BenchmarkId::new("baseline_as_str", len), |b| {
+            b.iter(|| black_box(&baseline).as_str().len());
+        });
+    }
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     // Every measurement here is a handful of nanoseconds, so criterion's
@@ -351,6 +394,6 @@ criterion_group! {
     config = Criterion::default()
         .warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(2));
-    targets = construction, clone, access, ownership, representations, shared_ownership, comparisons, text_inputs
+    targets = construction, clone, access, ownership, representations, shared_ownership, comparisons, text_inputs, constructor_pairs
 }
 criterion_main!(benches);

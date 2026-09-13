@@ -24,6 +24,7 @@ nami-core = { version = "0.3.3", default-features = false, optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
+suiteki_baseline = { version = "=0.1.0", package = "suiteki", features = ["serde", "nami"] }
 
 [features]
 # `std` only adds the impls that need the standard library's own types

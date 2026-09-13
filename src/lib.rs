@@ -357,7 +357,11 @@ impl Str {
     }
 
     /// Creates a `Str` holding a copy of `s`, inline when it fits.
-    #[inline]
+    #[expect(
+        clippy::inline_always,
+        reason = "keep the empty borrowed-string branch inside callers instead of an allocation-sized frame"
+    )]
+    #[inline(always)]
     pub(crate) fn from_borrowed(s: &str) -> Self {
         if s.is_empty() {
             Self::new()
