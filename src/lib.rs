@@ -1406,7 +1406,7 @@ mod tests {
 
         // Verify remaining strings are still valid
         for s in &strings {
-            assert!(!s.as_str().is_empty());
+            assert_ne!(s.as_str(), "");
         }
     }
 
@@ -1430,7 +1430,7 @@ mod tests {
 
         // Drop all clones
         clones.clear();
-        assert!(clones.is_empty());
+        assert_eq!(clones, [] as [Str; 0]);
         // no reference count exposed
     }
 
