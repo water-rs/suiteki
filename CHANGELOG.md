@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/water-rs/suiteki/compare/v0.1.1...v0.2.0) - 2026-11-13
+
+### Added
+
+- *(nami)* [**breaking**] implement the signal traits of nami-core 0.5 for Str
+
+### Fixed
+
+- satisfy Rust 1.100 clippy redundant_clone lint
+
+### Other
+
+- release from main and retire dev
+- drop the typos check
+- pass the release pull request's gate without CI
+- Merge remote-tracking branch 'origin/dev' into deps/24-nami-core-0.4-breaking
+- [**breaking**] implement Signal for nami-core 0.4
+- satisfy clippy::assert_is_empty
+- gate the declared rust-version on the floor toolchain ([#23](https://github.com/water-rs/suiteki/pull/23))
+- disable incremental builds and trim debuginfo ([#22](https://github.com/water-rs/suiteki/pull/22))
+- run tests with cargo nextest ([#21](https://github.com/water-rs/suiteki/pull/21))
+
 ## [0.1.1](https://github.com/water-rs/suiteki/compare/v0.1.0...v0.1.1) - 2026-09-13
 
 ### Added
