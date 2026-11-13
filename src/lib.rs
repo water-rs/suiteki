@@ -929,9 +929,9 @@ mod tests {
             assert_eq!(hash_of(&borrowed), hash_of(&owned));
             assert_eq!(hash_of(&owned), hash_of(&copied));
             assert_eq!(borrowed.cmp(&owned), core::cmp::Ordering::Equal);
-            assert_eq!(borrowed.clone().into_string(), text);
-            assert_eq!(owned.clone().into_string(), text);
-            assert_eq!(copied.clone().into_string(), text);
+            assert_eq!(borrowed.into_string(), text);
+            assert_eq!(owned.into_string(), text);
+            assert_eq!(copied.into_string(), text);
         }
     }
 
@@ -1406,7 +1406,7 @@ mod tests {
 
         // Verify remaining strings are still valid
         for s in &strings {
-            assert!(!s.as_str().is_empty());
+            assert_ne!(s.as_str(), "");
         }
     }
 
@@ -1430,7 +1430,7 @@ mod tests {
 
         // Drop all clones
         clones.clear();
-        assert!(clones.is_empty());
+        assert_eq!(clones, [] as [Str; 0]);
         // no reference count exposed
     }
 
